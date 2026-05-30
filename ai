@@ -1,4 +1,4 @@
--- Traceless Remote Monitor Extension v1.0
+-- Traceless Remote Monitor Extension v1.1
 -- Separate GitHub/loadstring module for your Traceless project.
 -- Authorized testing/debugging use inside your own Roblox game environment.
 --
@@ -237,9 +237,17 @@ return function(Library)
 		local camera = Workspace.CurrentCamera
 		local viewport = camera and camera.ViewportSize or Vector2.new(900, 600)
 		local mobile = viewport.X <= 760
-		local width = mobile and math.floor(math.clamp(viewport.X * 0.88, 310, viewport.X - 20)) or 430
-		local height = mobile and math.floor(math.clamp(viewport.Y * 0.70, 350, viewport.Y - 90)) or 520
-		local xOffset = mobile and 10 or 14
+
+		-- Smaller, cleaner monitor window.
+		local width = mobile
+			and math.floor(math.clamp(viewport.X * 0.78, 294, math.max(294, viewport.X - 24)))
+			or math.floor(math.clamp(viewport.X * 0.30, 330, 370))
+
+		local height = mobile
+			and math.floor(math.clamp(viewport.Y * 0.58, 310, math.max(310, viewport.Y - 110)))
+			or math.floor(math.clamp(viewport.Y * 0.58, 360, 445))
+
+		local xOffset = mobile and 8 or 12
 		local yOffset = -math.floor(height / 2)
 		return mobile, width, height, xOffset, yOffset
 	end
@@ -295,7 +303,11 @@ return function(Library)
 					and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
 					for _, monitor in pairs(HookState.Monitors) do
 						if monitor and monitor.Enabled and type(monitor.LogOutgoing) == "function" then
-							task.defer(monitor.LogOutgoing, self, method, args)
+							-- Safety: never let Remote Monitor errors affect gameplay remotes.
+							-- The original FireServer/InvokeServer call returns immediately below.
+							task.defer(function()
+								pcall(monitor.LogOutgoing, self, method, args)
+							end)
 						end
 					end
 				end
@@ -369,11 +381,11 @@ return function(Library)
 			Size = UDim2.new(1, -94, 1, 0),
 			Position = UDim2.fromOffset(12, 0),
 			BackgroundTransparency = 1,
-			Text = "Remote Monitor  •  v1.0",
+			Text = "Remote Monitor  •  v1.1",
 			TextColor3 = theme("Text", Color3.fromRGB(240, 240, 245)),
 			TextXAlignment = Enum.TextXAlignment.Left,
 			Font = Enum.Font.GothamBold,
-			TextSize = 14,
+			TextSize = 13,
 			Parent = header
 		})
 
@@ -391,6 +403,46 @@ return function(Library)
 		})
 		corner(closeButton, 9)
 		hover(closeButton, theme("Button", Color3.fromRGB(42, 42, 48)), theme("ButtonHover", Color3.fromRGB(57, 57, 65)))
+
+		-- Draggable Remote Monitor window.
+		do
+			local dragging = false
+			local dragStart = nil
+			local startPos = nil
+
+			header.InputBegan:Connect(function(inputObject)
+				if inputObject.UserInputType == Enum.UserInputType.MouseButton1 or inputObject.UserInputType == Enum.UserInputType.Touch then
+					dragging = true
+					dragStart = inputObject.Position
+					startPos = main.Position
+				end
+			end)
+
+			header.InputEnded:Connect(function(inputObject)
+				if inputObject.UserInputType == Enum.UserInputType.MouseButton1 or inputObject.UserInputType == Enum.UserInputType.Touch then
+					dragging = false
+				end
+			end)
+
+			UserInputService.InputChanged:Connect(function(inputObject)
+				if not dragging then
+					return
+				end
+
+				if inputObject.UserInputType ~= Enum.UserInputType.MouseMovement and inputObject.UserInputType ~= Enum.UserInputType.Touch then
+					return
+				end
+
+				local delta = inputObject.Position - dragStart
+
+				main.Position = UDim2.new(
+					startPos.X.Scale,
+					startPos.X.Offset + delta.X,
+					startPos.Y.Scale,
+					startPos.Y.Offset + delta.Y
+				)
+			end)
+		end
 
 		local statusLabel = make("TextLabel", {
 			Size = UDim2.new(1, -22, 0, 26),
@@ -438,7 +490,7 @@ return function(Library)
 		end
 
 		local logList = make("ScrollingFrame", {
-			Size = UDim2.new(1, -22, 0, math.floor((height - 168) * 0.52)),
+			Size = UDim2.new(1, -22, 0, math.floor((height - 168) * 0.44)),
 			Position = UDim2.fromOffset(11, 124),
 			BackgroundColor3 = theme("Background", Color3.fromRGB(8, 8, 10)),
 			BorderSizePixel = 0,
@@ -456,27 +508,40 @@ return function(Library)
 			Parent = logList
 		})
 
-		local detailsY = 132 + math.floor((height - 168) * 0.52)
-		local detailsBox = make("TextBox", {
+		local detailsY = 132 + math.floor((height - 168) * 0.44)
+
+		local detailsFrame = make("ScrollingFrame", {
 			Size = UDim2.new(1, -22, 1, -(detailsY + 52)),
 			Position = UDim2.fromOffset(11, detailsY),
 			BackgroundColor3 = theme("Background", Color3.fromRGB(8, 8, 10)),
+			BorderSizePixel = 0,
+			ScrollBarThickness = 4,
+			CanvasSize = UDim2.fromOffset(0, 0),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			ScrollingDirection = Enum.ScrollingDirection.Y,
+			Parent = main
+		})
+
+		corner(detailsFrame, 10)
+		stroke(detailsFrame)
+		padding(detailsFrame, 8, 8, 8, 8)
+
+		local detailsBox = make("TextBox", {
+			Size = UDim2.new(1, -8, 0, 120),
+			BackgroundTransparency = 1,
 			BorderSizePixel = 0,
 			Text = "Select a remote log.",
 			TextColor3 = theme("Text", Color3.fromRGB(240, 240, 245)),
 			TextXAlignment = Enum.TextXAlignment.Left,
 			TextYAlignment = Enum.TextYAlignment.Top,
-			TextWrapped = false,
+			TextWrapped = true,
 			TextEditable = false,
 			MultiLine = true,
 			ClearTextOnFocus = false,
 			Font = Enum.Font.Code,
-			TextSize = 11,
-			Parent = main
+			TextSize = 10,
+			Parent = detailsFrame
 		})
-		corner(detailsBox, 10)
-		stroke(detailsBox)
-		padding(detailsBox, 8, 8, 8, 8)
 
 		local bottom = make("Frame", {
 			Size = UDim2.new(1, -22, 0, 34),
@@ -514,9 +579,29 @@ return function(Library)
 			end
 		end
 
+		local function updateDetailsText(text)
+			text = tostring(text or "")
+			detailsBox.Text = text
+
+			task.defer(function()
+				local width = math.max(180, detailsFrame.AbsoluteSize.X - 22)
+				local lineCount = 1
+
+				for _ in text:gmatch("\n") do
+					lineCount += 1
+				end
+
+				local wrapEstimate = math.ceil(#text / math.max(width / 7, 1))
+				local estimatedHeight = math.max(120, lineCount * 15 + wrapEstimate * 12 + 34)
+
+				detailsBox.Size = UDim2.new(1, -8, 0, estimatedHeight)
+				detailsFrame.CanvasPosition = Vector2.new(0, 0)
+			end)
+		end
+
 		local function showLogDetails(log)
 			panel.SelectedLog = log
-			detailsBox.Text = buildRemoteContext(log)
+			updateDetailsText(buildRemoteContext(log))
 		end
 
 		local function addLogRow(log)
@@ -688,7 +773,7 @@ return function(Library)
 		function panel:Clear()
 			panel.Logs = {}
 			panel.SelectedLog = nil
-			detailsBox.Text = "Logs cleared."
+			updateDetailsText("Logs cleared.")
 			clearLogRows()
 			updateStatus()
 		end
