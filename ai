@@ -1,4 +1,4 @@
--- Traceless Remote Monitor Extension v1.2
+-- Traceless Remote Monitor Extension v1.3
 -- Separate GitHub/loadstring module for your Traceless project.
 -- Authorized testing/debugging use inside your own Roblox game environment.
 --
@@ -483,6 +483,16 @@ return function(Library)
 			Open = false,
 			Enabled = true,
 			IncomingEnabled = false,
+
+			-- AutoBlock does NOT block the actual remote call.
+			-- It only auto-mutes spammed logs so gameplay remotes are not broken.
+			AutoBlockEnabled = true,
+			AutoBlockWindow = 2.0,
+			AutoBlockLimit = 12,
+			AutoBlockDuration = 8.0,
+			AutoBlockStats = {},
+			AutoBlocked = {},
+
 			Logs = {},
 			SelectedLog = nil,
 			IncomingConnections = {},
@@ -522,7 +532,7 @@ return function(Library)
 			Size = UDim2.new(1, -94, 1, 0),
 			Position = UDim2.fromOffset(12, 0),
 			BackgroundTransparency = 1,
-			Text = "Remote Monitor  •  v1.2",
+			Text = "Remote Monitor  •  v1.3",
 			TextColor3 = theme("Text", Color3.fromRGB(240, 240, 245)),
 			TextXAlignment = Enum.TextXAlignment.Left,
 			Font = Enum.Font.GothamBold,
@@ -691,7 +701,7 @@ return function(Library)
 			Parent = main
 		})
 
-		local pauseButton, incomingButton
+		local pauseButton, incomingButton, autoBlockButton
 
 		local function notify(title, message, duration)
 			if Library.Notify then
@@ -703,12 +713,20 @@ return function(Library)
 			local hookText = HookState.Hooked and "hooked" or "not hooked"
 			local pauseText = panel.Enabled and "logging" or "paused"
 			local incomingText = panel.IncomingEnabled and "incoming on" or "incoming off"
-			statusLabel.Text = "Status: " .. hookText .. " | " .. pauseText .. " | " .. incomingText .. " | logs: " .. tostring(#panel.Logs)
+			local autoText = panel.AutoBlockEnabled and "auto on" or "auto off"
+
+			statusLabel.Text = "Status: " .. hookText .. " | " .. pauseText .. " | " .. incomingText .. " | " .. autoText .. " | logs: " .. tostring(#panel.Logs)
+
 			if pauseButton then
 				pauseButton.Text = panel.Enabled and "Pause" or "Resume"
 			end
+
 			if incomingButton then
 				incomingButton.Text = panel.IncomingEnabled and "Incoming On" or "Incoming Off"
+			end
+
+			if autoBlockButton then
+				autoBlockButton.Text = panel.AutoBlockEnabled and "Auto On" or "Auto Off"
 			end
 		end
 
@@ -771,8 +789,130 @@ return function(Library)
 			end)
 		end
 
+		local function getRemoteSpamKey(direction, remote, method)
+			local fullName = "UnknownRemote"
+
+			if typeof(remote) == "Instance" then
+				local ok, result = pcall(function()
+					return remote:GetFullName()
+				end)
+
+				if ok and result then
+					fullName = result
+				else
+					fullName = remote.Name
+				end
+			end
+
+			return tostring(direction) .. "|" .. tostring(method) .. "|" .. fullName
+		end
+
+		function panel:IsAutoBlocked(direction, remote, method)
+			if not panel.AutoBlockEnabled then
+				return false
+			end
+
+			local now = os.clock()
+			local key = getRemoteSpamKey(direction, remote, method)
+			local blocked = panel.AutoBlocked[key]
+
+			if blocked and blocked.UnblockAt and now < blocked.UnblockAt then
+				blocked.Suppressed = (blocked.Suppressed or 0) + 1
+				return true
+			end
+
+			if blocked and blocked.UnblockAt and now >= blocked.UnblockAt then
+				panel.AutoBlocked[key] = nil
+
+				local remoteName = typeof(remote) == "Instance" and remote.Name or "Remote"
+				local unblockLog = {
+					Direction = "AutoBlock",
+					Method = "Unblocked",
+					Remote = remote,
+					RemoteName = remoteName,
+					RemoteClass = typeof(remote) == "Instance" and remote.ClassName or "Unknown",
+					RemoteFullName = typeof(remote) == "Instance" and remote:GetFullName() or "Unknown",
+					RemotePath = typeof(remote) == "Instance" and makeSafeLuaPath(remote) or "nil",
+					TimeText = os.date("%H:%M:%S"),
+					ArgsCount = 0,
+					ArgsRaw = {},
+					ArgsPreview = "AutoBlock expired. Logging resumed.",
+					RunnerCode = "-- AutoBlock expired. Logging resumed."
+				}
+
+				table.insert(panel.Logs, unblockLog)
+				addLogRow(unblockLog)
+			end
+
+			local stat = panel.AutoBlockStats[key]
+
+			if not stat or now - stat.StartTime > panel.AutoBlockWindow then
+				stat = {
+					StartTime = now,
+					Count = 0
+				}
+
+				panel.AutoBlockStats[key] = stat
+			end
+
+			stat.Count += 1
+
+			if stat.Count >= panel.AutoBlockLimit then
+				panel.AutoBlocked[key] = {
+					UnblockAt = now + panel.AutoBlockDuration,
+					Suppressed = 0
+				}
+
+				panel.AutoBlockStats[key] = nil
+
+				local remoteName = typeof(remote) == "Instance" and remote.Name or "Remote"
+				local blockLog = {
+					Direction = "AutoBlock",
+					Method = "Muted",
+					Remote = remote,
+					RemoteName = remoteName,
+					RemoteClass = typeof(remote) == "Instance" and remote.ClassName or "Unknown",
+					RemoteFullName = typeof(remote) == "Instance" and remote:GetFullName() or "Unknown",
+					RemotePath = typeof(remote) == "Instance" and makeSafeLuaPath(remote) or "nil",
+					TimeText = os.date("%H:%M:%S"),
+					ArgsCount = 0,
+					ArgsRaw = {},
+					ArgsPreview = "This remote was logging too fast, so Remote Monitor muted its logs for " .. tostring(panel.AutoBlockDuration) .. " seconds. Gameplay remote calls are still allowed.",
+					RunnerCode = "-- AutoBlock muted logging only. It did not block the actual remote call."
+				}
+
+				table.insert(panel.Logs, blockLog)
+
+				while #panel.Logs > maxLogs do
+					table.remove(panel.Logs, 1)
+					local first = logList:FindFirstChildWhichIsA("TextButton")
+
+					if first then
+						first:Destroy()
+					end
+				end
+
+				addLogRow(blockLog)
+				updateStatus()
+				return true
+			end
+
+			return false
+		end
+
+		function panel:ClearAutoBlocks()
+			panel.AutoBlockStats = {}
+			panel.AutoBlocked = {}
+			notify("Remote Monitor", "AutoBlock cache cleared.", 2)
+			updateStatus()
+		end
+
 		function panel:AddRemoteLog(direction, remote, method, args)
 			if not panel.Enabled then
+				return
+			end
+
+			if panel:IsAutoBlocked(direction, remote, method) then
 				return
 			end
 			if typeof(remote) ~= "Instance" then
@@ -1036,20 +1176,19 @@ return function(Library)
 			panel:SetIncomingEnabled(not panel.IncomingEnabled)
 		end)
 
-		makeButton(toolbar, "Clear", 0.5, 0.25, function()
-			panel:Clear()
+		autoBlockButton = makeButton(toolbar, "Auto On", 0.5, 0.25, function()
+			panel.AutoBlockEnabled = not panel.AutoBlockEnabled
+
+			if not panel.AutoBlockEnabled then
+				panel:ClearAutoBlocks()
+			end
+
+			updateStatus()
 		end)
 
-		makeButton(toolbar, "Copy", 0.75, 0.25, function()
-			if not panel.SelectedLog then
-				notify("Remote Monitor", "Select a log first.", 2)
-				return
-			end
-			if safeClipboard(buildRemoteContext(panel.SelectedLog)) then
-				notify("Remote Monitor", "Remote context copied.", 2)
-			else
-				notify("Remote Monitor", "Clipboard unavailable.", 2)
-			end
+		makeButton(toolbar, "Clear", 0.75, 0.25, function()
+			panel:Clear()
+			panel:ClearAutoBlocks()
 		end)
 
 		makeButton(bottom, "Paste AI", 0, 0.25, function()
