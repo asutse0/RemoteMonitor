@@ -1,4 +1,4 @@
--- Traceless Remote Monitor Extension v2.1
+-- Traceless Remote Monitor Extension v2.2
 -- Separate GitHub/loadstring module for your Traceless project.
 -- Authorized testing/debugging use inside your own Roblox game environment.
 --
@@ -25,7 +25,7 @@ return function(Library)
 	local UserInputService = game:GetService("UserInputService")
 
 	local LocalPlayer = Players.LocalPlayer
-	local VERSION = "Remote Monitor v2.1"
+	local VERSION = "Remote Monitor v2.2"
 	local Theme = Library.Theme or {}
 
 	local function theme(name, fallback)
@@ -403,6 +403,7 @@ return function(Library)
 			"[Traceless Remote Monitor]",
 			"Direction: " .. tostring(log.Direction),
 			"Method: " .. tostring(log.Method),
+			"Hook Source: " .. tostring(log.HookSource or "Unknown"),
 			"Remote Name: " .. tostring(log.RemoteName),
 			"Remote Class: " .. tostring(log.RemoteClass),
 			"Remote FullName: " .. tostring(log.RemoteFullName),
@@ -488,12 +489,16 @@ return function(Library)
 	local GlobalStore = (type(getgenv) == "function" and getgenv()) or _G
 	GlobalStore.__TracelessRemoteMonitor = GlobalStore.__TracelessRemoteMonitor or {
 		Hooked = false,
+		FunctionHooked = false,
 		Active = false,
 		IgnoreDepth = 0,
 		Monitors = {},
 		NextMonitorId = 0,
 		OldNamecall = nil,
-		LastHookError = nil
+		OldFireServer = nil,
+		OldInvokeServer = nil,
+		LastHookError = nil,
+		LastFunctionHookError = nil
 	}
 
 	local HookState = GlobalStore.__TracelessRemoteMonitor
@@ -509,14 +514,40 @@ return function(Library)
 		HookState.Monitors[id] = nil
 	end
 
+	local function dispatchOutgoingLog(remote, method, args, hookSource)
+		if not HookState.Active then
+			return
+		end
+
+		if (HookState.IgnoreDepth or 0) > 0 then
+			return
+		end
+
+		if typeof(remote) ~= "Instance" then
+			return
+		end
+
+		args = args or {}
+
+		for _, monitor in pairs(HookState.Monitors) do
+			if monitor and monitor.Enabled and monitor.OutgoingEnabled and type(monitor.LogOutgoing) == "function" then
+				task.defer(function()
+					pcall(monitor.LogOutgoing, remote, method, args, hookSource)
+				end)
+			end
+		end
+	end
+
 	local function installNamecallHook()
 		if HookState.Hooked then
-			return true, "Already hooked."
+			return true, "Namecall already hooked."
 		end
+
 		if type(hookmetamethod) ~= "function" then
 			HookState.LastHookError = "hookmetamethod is not available."
 			return false, HookState.LastHookError
 		end
+
 		if type(getnamecallmethod) ~= "function" then
 			HookState.LastHookError = "getnamecallmethod is not available."
 			return false, HookState.LastHookError
@@ -527,31 +558,13 @@ return function(Library)
 		end
 
 		local oldNamecall
+
 		local ok, result = pcall(function()
 			oldNamecall = hookmetamethod(game, "__namecall", wrap(function(self, ...)
 				local method = getnamecallmethod()
 
-				if HookState.Active
-					and (HookState.IgnoreDepth or 0) <= 0
-					and (method == "FireServer" or method == "InvokeServer")
-					and typeof(self) == "Instance" then
-
-					-- v2.1 IMPORTANT:
-					-- Keep the hook extremely tiny.
-					-- Do NOT call self:IsA(), self.ClassName, debug.info, or checkcaller() here.
-					-- Some environments report checkcaller() as true inside hooks and skip all game calls.
-					-- We only capture method + instance + args, then validate later outside the hook.
-					local remote = self
-					local remoteMethod = method
-					local remoteArgs = { ... }
-
-					for _, monitor in pairs(HookState.Monitors) do
-						if monitor and monitor.Enabled and monitor.OutgoingEnabled and type(monitor.LogOutgoing) == "function" then
-							task.defer(function()
-								pcall(monitor.LogOutgoing, remote, remoteMethod, remoteArgs)
-							end)
-						end
-					end
+				if method == "FireServer" or method == "InvokeServer" then
+					dispatchOutgoingLog(self, method, { ... }, "__namecall")
 				end
 
 				return oldNamecall(self, ...)
@@ -566,7 +579,69 @@ return function(Library)
 		HookState.Hooked = true
 		HookState.OldNamecall = oldNamecall
 		HookState.LastHookError = nil
-		return true, "Hook installed."
+
+		return true, "Namecall hook installed."
+	end
+
+	local function installFunctionHooks()
+		if HookState.FunctionHooked then
+			return true, "Function hooks already installed."
+		end
+
+		if type(hookfunction) ~= "function" then
+			HookState.LastFunctionHookError = "hookfunction is not available."
+			return false, HookState.LastFunctionHookError
+		end
+
+		local wrap = type(newcclosure) == "function" and newcclosure or function(fn)
+			return fn
+		end
+
+		local ok, result = pcall(function()
+			local sampleEvent = Instance.new("RemoteEvent")
+			local sampleFunction = Instance.new("RemoteFunction")
+
+			local oldFireServer
+			oldFireServer = hookfunction(sampleEvent.FireServer, wrap(function(self, ...)
+				dispatchOutgoingLog(self, "FireServer", { ... }, "hookfunction.FireServer")
+				return oldFireServer(self, ...)
+			end))
+
+			local oldInvokeServer
+			oldInvokeServer = hookfunction(sampleFunction.InvokeServer, wrap(function(self, ...)
+				dispatchOutgoingLog(self, "InvokeServer", { ... }, "hookfunction.InvokeServer")
+				return oldInvokeServer(self, ...)
+			end))
+
+			HookState.OldFireServer = oldFireServer
+			HookState.OldInvokeServer = oldInvokeServer
+		end)
+
+		if not ok then
+			HookState.LastFunctionHookError = tostring(result)
+			return false, HookState.LastFunctionHookError
+		end
+
+		HookState.FunctionHooked = true
+		HookState.LastFunctionHookError = nil
+
+		return true, "Function hooks installed."
+	end
+
+	local function installOutgoingHooks()
+		local namecallOk, namecallMessage = installNamecallHook()
+		local functionOk, functionMessage = installFunctionHooks()
+
+		if namecallOk or functionOk then
+			local parts = {}
+
+			table.insert(parts, namecallOk and "namecall ready" or ("namecall failed: " .. tostring(namecallMessage)))
+			table.insert(parts, functionOk and "function ready" or ("function failed: " .. tostring(functionMessage)))
+
+			return true, table.concat(parts, " | ")
+		end
+
+		return false, tostring(namecallMessage) .. " | " .. tostring(functionMessage)
 	end
 
 	function Library:CreateRemoteMonitorPanel(config)
@@ -633,7 +708,7 @@ return function(Library)
 			Size = UDim2.new(1, -94, 1, 0),
 			Position = UDim2.fromOffset(12, 0),
 			BackgroundTransparency = 1,
-			Text = "Remote Monitor  •  v2.1",
+			Text = "Remote Monitor  •  v2.2",
 			TextColor3 = theme("Text", Color3.fromRGB(240, 240, 245)),
 			TextXAlignment = Enum.TextXAlignment.Left,
 			Font = Enum.Font.GothamBold,
@@ -940,7 +1015,7 @@ return function(Library)
 			end)
 		end
 
-		function panel:AddRemoteLog(direction, remote, method, args)
+		function panel:AddRemoteLog(direction, remote, method, args, hookSource)
 			if not panel.Enabled then
 				return
 			end
@@ -975,6 +1050,7 @@ return function(Library)
 				existingLog.ArgsRaw = args
 				existingLog.ArgsPreview = buildArgsPreview(args)
 				existingLog.RunnerCode = buildRunnerCode(existingLog)
+				existingLog.HookSource = tostring(hookSource or existingLog.HookSource or "Unknown")
 
 				panel.LatestLog = existingLog
 
@@ -998,6 +1074,7 @@ return function(Library)
 				RemoteClass = remote.ClassName,
 				RemoteFullName = remote:GetFullName(),
 				RemotePath = makeSafeLuaPath(remote),
+				HookSource = tostring(hookSource or "Unknown"),
 				TimeText = os.date("%H:%M:%S"),
 				LastTimeText = os.date("%H:%M:%S"),
 				Count = 1,
@@ -1046,8 +1123,8 @@ return function(Library)
 			updateStatus()
 		end
 
-		function panel.LogOutgoing(remote, method, args)
-			panel:AddRemoteLog("Client -> Server", remote, method, args)
+		function panel.LogOutgoing(remote, method, args, hookSource)
+			panel:AddRemoteLog("Client -> Server", remote, method, args, hookSource)
 		end
 
 		local function disconnectIncoming()
@@ -1108,12 +1185,12 @@ return function(Library)
 			HookState.Active = panel.OutgoingEnabled
 
 			if panel.OutgoingEnabled then
-				local hookOk, hookMessage = installNamecallHook()
+				local hookOk, hookMessage = installOutgoingHooks()
 
 				if hookOk then
-					statusLabel.Text = "Status: outgoing hook ready."
+					statusLabel.Text = "Status: outgoing hooks ready."
 					statusLabel.TextColor3 = theme("Success", Color3.fromRGB(50, 88, 62))
-					notify("Remote Monitor", "Outgoing logging enabled with tiny method-only hook.", 2)
+					notify("Remote Monitor", tostring(hookMessage), 4)
 				else
 					panel.OutgoingEnabled = false
 					HookState.Active = false
@@ -1378,7 +1455,7 @@ return function(Library)
 		tab:AddButton("Toggle Remote Monitor", function()
 			panel:Toggle()
 		end)
-		tab:AddLabel("Remote Monitor v2.1: tiny method-only hook, no checkcaller skip, grouped rows keep latest args.")
+		tab:AddLabel("Remote Monitor v2.2: double hook catches :FireServer and .FireServer style calls; rows keep latest args.")
 		return panel
 	end
 
