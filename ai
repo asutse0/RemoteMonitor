@@ -1,4 +1,4 @@
--- Traceless Remote Monitor Extension v1.9
+-- Traceless Remote Monitor Extension v2.0
 -- Separate GitHub/loadstring module for your Traceless project.
 -- Authorized testing/debugging use inside your own Roblox game environment.
 --
@@ -25,7 +25,7 @@ return function(Library)
 	local UserInputService = game:GetService("UserInputService")
 
 	local LocalPlayer = Players.LocalPlayer
-	local VERSION = "Remote Monitor v1.9"
+	local VERSION = "Remote Monitor v2.0"
 	local Theme = Library.Theme or {}
 
 	local function theme(name, fallback)
@@ -529,37 +529,49 @@ return function(Library)
 		local ok, result = pcall(function()
 			oldNamecall = hookmetamethod(game, "__namecall", wrap(function(self, ...)
 				local method = getnamecallmethod()
-				local args = { ... }
 
 				if HookState.Active
 					and (method == "FireServer" or method == "InvokeServer")
-					and typeof(self) == "Instance"
-					and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
+					and typeof(self) == "Instance" then
 
-					-- Ultra-safe hook path:
-					-- 1. Do not call debug/getcallingscript inside __namecall.
-					-- 2. Do not block/delay the original remote.
-					-- 3. Skip Remote Monitor's own calls when checkcaller exists.
-					local shouldLog = true
+					-- v2.0 IMPORTANT:
+					-- Never call self:IsA() inside a __namecall hook.
+					-- IsA is itself a namecall and can recurse/break remotes in some environments.
+					local className = nil
+					local okClass, classResult = pcall(function()
+						return self.ClassName
+					end)
 
-					if type(checkcaller) == "function" then
-						local okCheck, isOurCall = pcall(checkcaller)
-
-						if okCheck and isOurCall then
-							shouldLog = false
-						end
+					if okClass then
+						className = classResult
 					end
 
-					if shouldLog then
-						local remote = self
-						local remoteMethod = method
-						local remoteArgs = args
+					local isRemoteEvent = className == "RemoteEvent"
+					local isRemoteFunction = className == "RemoteFunction"
+					local methodMatchesClass = (method == "FireServer" and isRemoteEvent) or (method == "InvokeServer" and isRemoteFunction)
 
-						for _, monitor in pairs(HookState.Monitors) do
-							if monitor and monitor.Enabled and monitor.OutgoingEnabled and type(monitor.LogOutgoing) == "function" then
-								task.defer(function()
-									pcall(monitor.LogOutgoing, remote, remoteMethod, remoteArgs)
-								end)
+					if methodMatchesClass then
+						local shouldLog = true
+
+						if type(checkcaller) == "function" then
+							local okCheck, isOurCall = pcall(checkcaller)
+
+							if okCheck and isOurCall then
+								shouldLog = false
+							end
+						end
+
+						if shouldLog then
+							local remote = self
+							local remoteMethod = method
+							local remoteArgs = { ... }
+
+							for _, monitor in pairs(HookState.Monitors) do
+								if monitor and monitor.Enabled and monitor.OutgoingEnabled and type(monitor.LogOutgoing) == "function" then
+									task.defer(function()
+										pcall(monitor.LogOutgoing, remote, remoteMethod, remoteArgs)
+									end)
+								end
 							end
 						end
 					end
@@ -644,7 +656,7 @@ return function(Library)
 			Size = UDim2.new(1, -94, 1, 0),
 			Position = UDim2.fromOffset(12, 0),
 			BackgroundTransparency = 1,
-			Text = "Remote Monitor  •  v1.9",
+			Text = "Remote Monitor  •  v2.0",
 			TextColor3 = theme("Text", Color3.fromRGB(240, 240, 245)),
 			TextXAlignment = Enum.TextXAlignment.Left,
 			Font = Enum.Font.GothamBold,
@@ -1114,7 +1126,7 @@ return function(Library)
 				if hookOk then
 					statusLabel.Text = "Status: outgoing hook ready."
 					statusLabel.TextColor3 = theme("Success", Color3.fromRGB(50, 88, 62))
-					notify("Remote Monitor", "Outgoing FireServer/InvokeServer logging enabled.", 2)
+					notify("Remote Monitor", "Outgoing logging enabled with safer ClassName hook.", 2)
 				else
 					panel.OutgoingEnabled = false
 					HookState.Active = false
@@ -1366,7 +1378,7 @@ return function(Library)
 		tab:AddButton("Toggle Remote Monitor", function()
 			panel:Toggle()
 		end)
-		tab:AddLabel("Remote Monitor v1.9: Same remote rows always store latest args. Click a row to inspect its latest captured version.")
+		tab:AddLabel("Remote Monitor v2.0: safer namecall hook, groups same remotes, rows always keep latest args.")
 		return panel
 	end
 
