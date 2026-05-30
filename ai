@@ -1,4 +1,4 @@
--- Traceless Remote Monitor Extension v1.5
+-- Traceless Remote Monitor Extension v1.6
 -- Separate GitHub/loadstring module for your Traceless project.
 -- Authorized testing/debugging use inside your own Roblox game environment.
 --
@@ -25,7 +25,7 @@ return function(Library)
 	local UserInputService = game:GetService("UserInputService")
 
 	local LocalPlayer = Players.LocalPlayer
-	local VERSION = "Remote Monitor v1.5"
+	local VERSION = "Remote Monitor v1.6"
 	local Theme = Library.Theme or {}
 
 	local function theme(name, fallback)
@@ -535,14 +535,25 @@ return function(Library)
 					and typeof(self) == "Instance"
 					and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
 
-					local callerInfo = getCallerScriptInfo()
+					-- Ultra-safe hook path:
+					-- Do not do heavy caller/debug work directly inside __namecall.
+					-- Defer all monitor work and always return the original remote call below.
+					local remote = self
+					local remoteMethod = method
+					local remoteArgs = args
 
 					for _, monitor in pairs(HookState.Monitors) do
 						if monitor and monitor.Enabled and type(monitor.LogOutgoing) == "function" then
-							-- Safety: never let Remote Monitor errors affect gameplay remotes.
-							-- The original FireServer/InvokeServer call returns immediately below.
 							task.defer(function()
-								pcall(monitor.LogOutgoing, self, method, args, callerInfo)
+								pcall(function()
+									local callerInfo = nil
+
+									if monitor.CallerDetectEnabled then
+										callerInfo = getCallerScriptInfo()
+									end
+
+									monitor.LogOutgoing(remote, remoteMethod, remoteArgs, callerInfo)
+								end)
 							end)
 						end
 					end
@@ -584,10 +595,14 @@ return function(Library)
 			AutoBlockEnabled = true,
 
 			-- AutoBlock is a logging cooldown, not a gameplay remote blocker.
-			-- When enabled, the same remote/method/direction only logs once every 2 seconds.
-			AutoBlockCooldown = 2.0,
+			-- When enabled, the same remote/method/direction only logs once every 5 seconds.
+			AutoBlockCooldown = 5.0,
 			AutoCooldowns = {},
 			AutoSuppressed = {},
+
+			-- Caller detection can be heavier in some executors/environments.
+			-- Keep it off by default so remotes are less likely to be affected.
+			CallerDetectEnabled = false,
 
 			AutoBlockWindow = 2.0,
 			AutoBlockLimit = 12,
@@ -634,7 +649,7 @@ return function(Library)
 			Size = UDim2.new(1, -94, 1, 0),
 			Position = UDim2.fromOffset(12, 0),
 			BackgroundTransparency = 1,
-			Text = "Remote Monitor  •  v1.5",
+			Text = "Remote Monitor  •  v1.6",
 			TextColor3 = theme("Text", Color3.fromRGB(240, 240, 245)),
 			TextXAlignment = Enum.TextXAlignment.Left,
 			Font = Enum.Font.GothamBold,
@@ -803,7 +818,7 @@ return function(Library)
 			Parent = main
 		})
 
-		local pauseButton, incomingButton, autoBlockButton
+		local pauseButton, incomingButton, autoBlockButton, callerButton
 
 		local function notify(title, message, duration)
 			if Library.Notify then
@@ -816,8 +831,9 @@ return function(Library)
 			local pauseText = panel.Enabled and "logging" or "paused"
 			local incomingText = panel.IncomingEnabled and "incoming on" or "incoming off"
 			local autoText = panel.AutoBlockEnabled and ("auto " .. tostring(panel.AutoBlockCooldown) .. "s") or "auto off"
+			local callerText = panel.CallerDetectEnabled and "caller on" or "caller off"
 
-			statusLabel.Text = "Status: " .. hookText .. " | " .. pauseText .. " | " .. incomingText .. " | " .. autoText .. " | logs: " .. tostring(#panel.Logs)
+			statusLabel.Text = "Status: " .. hookText .. " | " .. pauseText .. " | " .. incomingText .. " | " .. autoText .. " | " .. callerText .. " | logs: " .. tostring(#panel.Logs)
 
 			if pauseButton then
 				pauseButton.Text = panel.Enabled and "Pause" or "Resume"
@@ -829,6 +845,10 @@ return function(Library)
 
 			if autoBlockButton then
 				autoBlockButton.Text = panel.AutoBlockEnabled and "Auto On" or "Auto Off"
+			end
+
+			if callerButton then
+				callerButton.Text = panel.CallerDetectEnabled and "Caller On" or "Caller Off"
 			end
 		end
 
@@ -1321,24 +1341,29 @@ return function(Library)
 			updateStatus()
 		end)
 
-		makeButton(toolbar, "Clear", 0.75, 0.25, function()
+		callerButton = makeButton(toolbar, "Caller Off", 0.75, 0.25, function()
+			panel.CallerDetectEnabled = not panel.CallerDetectEnabled
+			updateStatus()
+		end)
+
+		makeButton(bottom, "Clear", 0, 0.2, function()
 			panel:Clear()
 			panel:ClearAutoBlocks()
 		end)
 
-		makeButton(bottom, "Paste AI", 0, 0.25, function()
+		makeButton(bottom, "AI", 0.2, 0.2, function()
 			panel:PasteSelectedToChat()
 		end)
 
-		makeButton(bottom, "Find Dex", 0.25, 0.25, function()
+		makeButton(bottom, "Dex", 0.4, 0.2, function()
 			panel:FindSelectedInDex()
 		end)
 
-		makeButton(bottom, "Copy Run", 0.5, 0.25, function()
+		makeButton(bottom, "CopyRun", 0.6, 0.2, function()
 			panel:CopyRunnerCode()
 		end)
 
-		makeButton(bottom, "Run", 0.75, 0.25, function()
+		makeButton(bottom, "Run", 0.8, 0.2, function()
 			panel:RunSelectedRemote()
 		end)
 
