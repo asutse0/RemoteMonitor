@@ -1,0 +1,824 @@
+-- Traceless Remote Monitor Extension v1.0
+-- Separate GitHub/loadstring module for your Traceless project.
+-- Authorized testing/debugging use inside your own Roblox game environment.
+--
+-- Use:
+-- local InstallRemoteMonitor = loadstring(game:HttpGet(REMOTE_MONITOR_URL))()
+-- InstallRemoteMonitor(Library)
+--
+-- Adds:
+-- Library:CreateRemoteMonitorPanel({ Chat = Chat })
+-- Library:AddRemoteMonitorToggle(tab, { Chat = Chat })
+--
+-- Captures outgoing client -> server remotes with hookmetamethod __namecall:
+-- RemoteEvent:FireServer(...)
+-- RemoteFunction:InvokeServer(...)
+--
+-- Optional incoming server -> client watcher:
+-- Press Incoming in the panel to attach OnClientEvent listeners to common visible roots.
+
+return function(Library)
+	local Players = game:GetService("Players")
+	local Workspace = game:GetService("Workspace")
+	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+	local TweenService = game:GetService("TweenService")
+	local UserInputService = game:GetService("UserInputService")
+
+	local LocalPlayer = Players.LocalPlayer
+	local VERSION = "Remote Monitor v1.0"
+	local Theme = Library.Theme or {}
+
+	local function theme(name, fallback)
+		return Theme[name] or fallback
+	end
+
+	local function make(className, props, children)
+		local obj = Instance.new(className)
+		for k, v in pairs(props or {}) do
+			obj[k] = v
+		end
+		for _, child in ipairs(children or {}) do
+			child.Parent = obj
+		end
+		return obj
+	end
+
+	local function corner(parent, radius)
+		return make("UICorner", {
+			CornerRadius = UDim.new(0, radius or 10),
+			Parent = parent
+		})
+	end
+
+	local function stroke(parent, color, thickness, transparency)
+		return make("UIStroke", {
+			Color = color or theme("StrokeSoft", Color3.fromRGB(42, 42, 48)),
+			Thickness = thickness or 1,
+			Transparency = transparency or 0.25,
+			Parent = parent
+		})
+	end
+
+	local function padding(parent, left, right, top, bottom)
+		return make("UIPadding", {
+			PaddingLeft = UDim.new(0, left or 0),
+			PaddingRight = UDim.new(0, right or 0),
+			PaddingTop = UDim.new(0, top or 0),
+			PaddingBottom = UDim.new(0, bottom or 0),
+			Parent = parent
+		})
+	end
+
+	local function hover(button, normal, over)
+		button.MouseEnter:Connect(function()
+			button.BackgroundColor3 = over
+		end)
+		button.MouseLeave:Connect(function()
+			button.BackgroundColor3 = normal
+		end)
+	end
+
+	local function safeClipboard(text)
+		text = tostring(text or "")
+		if type(setclipboard) == "function" then
+			setclipboard(text)
+			return true
+		end
+		if type(toclipboard) == "function" then
+			toclipboard(text)
+			return true
+		end
+		if type(set_clipboard) == "function" then
+			set_clipboard(text)
+			return true
+		end
+		return false
+	end
+
+	local function getServiceName(instance)
+		local services = {
+			[Workspace] = "Workspace",
+			[ReplicatedStorage] = "ReplicatedStorage",
+			[Players] = "Players"
+		}
+		return services[instance]
+	end
+
+	local function makeSafeLuaPath(instance)
+		if not instance then
+			return "nil"
+		end
+		local chain = {}
+		local current = instance
+		while current and current ~= game do
+			table.insert(chain, 1, current)
+			current = current.Parent
+		end
+		local root = chain[1]
+		if not root then
+			return "nil"
+		end
+		local rootService = getServiceName(root)
+		local path = rootService and ('game:GetService("%s")'):format(rootService) or "game"
+		local startIndex = rootService and 2 or 1
+		for i = startIndex, #chain do
+			local safeName = chain[i].Name:gsub("\\", "\\\\"):gsub('"', '\\"')
+			path ..= (':WaitForChild("%s")'):format(safeName)
+		end
+		return path
+	end
+
+	local function short(text, limit)
+		text = tostring(text or "")
+		limit = limit or 120
+		if #text > limit then
+			return text:sub(1, limit) .. "...(truncated)"
+		end
+		return text
+	end
+
+	local function previewValue(value, depth, seen)
+		depth = depth or 0
+		seen = seen or {}
+		local valueType = typeof(value)
+
+		if valueType == "Instance" then
+			local ok, fullName = pcall(function()
+				return value:GetFullName()
+			end)
+			return value.ClassName .. " <" .. (ok and fullName or value.Name) .. ">"
+		end
+
+		if valueType == "string" then
+			return '"' .. short(value:gsub("\n", "\\n"), 140) .. '"'
+		end
+
+		if valueType == "number" or valueType == "boolean" or valueType == "nil" then
+			return tostring(value)
+		end
+
+		if valueType == "Vector3" then
+			return ("Vector3(%.2f, %.2f, %.2f)"):format(value.X, value.Y, value.Z)
+		end
+
+		if valueType == "Vector2" then
+			return ("Vector2(%.2f, %.2f)"):format(value.X, value.Y)
+		end
+
+		if valueType == "CFrame" then
+			local p = value.Position
+			return ("CFrame(%.2f, %.2f, %.2f)"):format(p.X, p.Y, p.Z)
+		end
+
+		if valueType == "Color3" then
+			return ("Color3(%d, %d, %d)"):format(value.R * 255, value.G * 255, value.B * 255)
+		end
+
+		if valueType == "EnumItem" then
+			return tostring(value)
+		end
+
+		if valueType == "table" then
+			if seen[value] then
+				return "{cycle}"
+			end
+			if depth >= 2 then
+				return "{...}"
+			end
+			seen[value] = true
+			local parts = {}
+			local count = 0
+			for k, v in pairs(value) do
+				count += 1
+				if count > 8 then
+					table.insert(parts, "...more")
+					break
+				end
+				table.insert(parts, "[" .. previewValue(k, depth + 1, seen) .. "]=" .. previewValue(v, depth + 1, seen))
+			end
+			return "{" .. table.concat(parts, ", ") .. "}"
+		end
+
+		return valueType .. "(" .. tostring(value) .. ")"
+	end
+
+	local function buildArgsPreview(args)
+		local lines = {}
+		for i, value in ipairs(args or {}) do
+			table.insert(lines, tostring(i) .. ". " .. typeof(value) .. " = " .. previewValue(value))
+		end
+		if #lines == 0 then
+			return "(no args)"
+		end
+		return table.concat(lines, "\n")
+	end
+
+	local function buildRemoteContext(log)
+		if not log then
+			return "No remote log selected."
+		end
+		return table.concat({
+			"[Traceless Remote Monitor]",
+			"Direction: " .. tostring(log.Direction),
+			"Method: " .. tostring(log.Method),
+			"Remote Name: " .. tostring(log.RemoteName),
+			"Remote Class: " .. tostring(log.RemoteClass),
+			"Remote FullName: " .. tostring(log.RemoteFullName),
+			"Remote LuaPath: " .. tostring(log.RemotePath),
+			"Time: " .. tostring(log.TimeText),
+			"Args Count: " .. tostring(log.ArgsCount),
+			"",
+			"Args:",
+			tostring(log.ArgsPreview or "(no args)")
+		}, "\n")
+	end
+
+	local function getPanelSize()
+		local camera = Workspace.CurrentCamera
+		local viewport = camera and camera.ViewportSize or Vector2.new(900, 600)
+		local mobile = viewport.X <= 760
+		local width = mobile and math.floor(math.clamp(viewport.X * 0.88, 310, viewport.X - 20)) or 430
+		local height = mobile and math.floor(math.clamp(viewport.Y * 0.70, 350, viewport.Y - 90)) or 520
+		local xOffset = mobile and 10 or 14
+		local yOffset = -math.floor(height / 2)
+		return mobile, width, height, xOffset, yOffset
+	end
+
+	--// Global hook state
+	local GlobalStore = (type(getgenv) == "function" and getgenv()) or _G
+	GlobalStore.__TracelessRemoteMonitor = GlobalStore.__TracelessRemoteMonitor or {
+		Hooked = false,
+		Monitors = {},
+		NextMonitorId = 0,
+		OldNamecall = nil,
+		LastHookError = nil
+	}
+
+	local HookState = GlobalStore.__TracelessRemoteMonitor
+
+	local function registerMonitor(monitor)
+		HookState.NextMonitorId += 1
+		local id = HookState.NextMonitorId
+		HookState.Monitors[id] = monitor
+		return id
+	end
+
+	local function unregisterMonitor(id)
+		HookState.Monitors[id] = nil
+	end
+
+	local function installNamecallHook()
+		if HookState.Hooked then
+			return true, "Already hooked."
+		end
+		if type(hookmetamethod) ~= "function" then
+			HookState.LastHookError = "hookmetamethod is not available."
+			return false, HookState.LastHookError
+		end
+		if type(getnamecallmethod) ~= "function" then
+			HookState.LastHookError = "getnamecallmethod is not available."
+			return false, HookState.LastHookError
+		end
+
+		local wrap = type(newcclosure) == "function" and newcclosure or function(fn)
+			return fn
+		end
+
+		local oldNamecall
+		local ok, result = pcall(function()
+			oldNamecall = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+				local method = getnamecallmethod()
+				local args = { ... }
+
+				if (method == "FireServer" or method == "InvokeServer")
+					and typeof(self) == "Instance"
+					and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
+					for _, monitor in pairs(HookState.Monitors) do
+						if monitor and monitor.Enabled and type(monitor.LogOutgoing) == "function" then
+							task.defer(monitor.LogOutgoing, self, method, args)
+						end
+					end
+				end
+
+				return oldNamecall(self, ...)
+			end))
+		end)
+
+		if not ok then
+			HookState.LastHookError = tostring(result)
+			return false, HookState.LastHookError
+		end
+
+		HookState.Hooked = true
+		HookState.OldNamecall = oldNamecall
+		HookState.LastHookError = nil
+		return true, "Hook installed."
+	end
+
+	function Library:CreateRemoteMonitorPanel(config)
+		config = config or {}
+		if self.RemoteMonitorPanel and self.RemoteMonitorPanel.Gui then
+			return self.RemoteMonitorPanel
+		end
+
+		local chat = config.Chat
+		local maxLogs = tonumber(config.MaxLogs) or 150
+		local parent = self:GetParent()
+		local _, width, height, xOffset, yOffset = getPanelSize()
+
+		local panel = {
+			Open = false,
+			Enabled = true,
+			IncomingEnabled = false,
+			Logs = {},
+			SelectedLog = nil,
+			IncomingConnections = {},
+			DescendantConnections = {},
+			MonitorId = nil
+		}
+
+		local gui = make("ScreenGui", {
+			Name = "TracelessRemoteMonitorPanel",
+			ResetOnSpawn = false,
+			IgnoreGuiInset = true,
+			ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+			Parent = parent
+		})
+
+		local main = make("Frame", {
+			Size = UDim2.fromOffset(width, height),
+			Position = UDim2.new(0, -width - 20, 0.5, yOffset),
+			BackgroundColor3 = theme("Window", Color3.fromRGB(12, 12, 15)),
+			BorderSizePixel = 0,
+			Visible = false,
+			ClipsDescendants = true,
+			Parent = gui
+		})
+		corner(main, 14)
+		stroke(main, theme("Stroke", Color3.fromRGB(65, 65, 72)), 1, 0.18)
+
+		local header = make("Frame", {
+			Size = UDim2.new(1, 0, 0, 46),
+			BackgroundColor3 = theme("Header", Color3.fromRGB(18, 18, 22)),
+			BorderSizePixel = 0,
+			Parent = main
+		})
+		corner(header, 14)
+
+		make("TextLabel", {
+			Size = UDim2.new(1, -94, 1, 0),
+			Position = UDim2.fromOffset(12, 0),
+			BackgroundTransparency = 1,
+			Text = "Remote Monitor  •  v1.0",
+			TextColor3 = theme("Text", Color3.fromRGB(240, 240, 245)),
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Font = Enum.Font.GothamBold,
+			TextSize = 14,
+			Parent = header
+		})
+
+		local closeButton = make("TextButton", {
+			Size = UDim2.fromOffset(34, 30),
+			Position = UDim2.new(1, -42, 0, 8),
+			BackgroundColor3 = theme("Button", Color3.fromRGB(42, 42, 48)),
+			BorderSizePixel = 0,
+			Text = "×",
+			TextColor3 = theme("Text", Color3.fromRGB(240, 240, 245)),
+			Font = Enum.Font.GothamBold,
+			TextSize = 18,
+			AutoButtonColor = false,
+			Parent = header
+		})
+		corner(closeButton, 9)
+		hover(closeButton, theme("Button", Color3.fromRGB(42, 42, 48)), theme("ButtonHover", Color3.fromRGB(57, 57, 65)))
+
+		local statusLabel = make("TextLabel", {
+			Size = UDim2.new(1, -22, 0, 26),
+			Position = UDim2.fromOffset(11, 52),
+			BackgroundColor3 = theme("Panel2", Color3.fromRGB(24, 24, 28)),
+			BorderSizePixel = 0,
+			Text = "Status: installing hook...",
+			TextColor3 = theme("Muted", Color3.fromRGB(155, 155, 165)),
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Font = Enum.Font.GothamBold,
+			TextSize = 10,
+			Parent = main
+		})
+		corner(statusLabel, 8)
+		padding(statusLabel, 8, 8, 0, 0)
+
+		local toolbar = make("Frame", {
+			Size = UDim2.new(1, -22, 0, 34),
+			Position = UDim2.fromOffset(11, 84),
+			BackgroundTransparency = 1,
+			Parent = main
+		})
+
+		local function makeButton(parentFrame, text, xScale, widthScale, callback)
+			local button = make("TextButton", {
+				Size = UDim2.new(widthScale, -5, 1, 0),
+				Position = UDim2.new(xScale, 0, 0, 0),
+				BackgroundColor3 = theme("Button", Color3.fromRGB(42, 42, 48)),
+				BorderSizePixel = 0,
+				Text = text,
+				TextColor3 = theme("Text", Color3.fromRGB(240, 240, 245)),
+				Font = Enum.Font.GothamBold,
+				TextSize = 10,
+				AutoButtonColor = false,
+				Parent = parentFrame
+			})
+			corner(button, 8)
+			hover(button, theme("Button", Color3.fromRGB(42, 42, 48)), theme("ButtonHover", Color3.fromRGB(57, 57, 65)))
+			button.MouseButton1Click:Connect(function()
+				if callback then
+					task.spawn(callback)
+				end
+			end)
+			return button
+		end
+
+		local logList = make("ScrollingFrame", {
+			Size = UDim2.new(1, -22, 0, math.floor((height - 168) * 0.52)),
+			Position = UDim2.fromOffset(11, 124),
+			BackgroundColor3 = theme("Background", Color3.fromRGB(8, 8, 10)),
+			BorderSizePixel = 0,
+			ScrollBarThickness = 4,
+			CanvasSize = UDim2.fromOffset(0, 0),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			Parent = main
+		})
+		corner(logList, 10)
+		stroke(logList)
+		padding(logList, 6, 6, 6, 6)
+		make("UIListLayout", {
+			Padding = UDim.new(0, 4),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+			Parent = logList
+		})
+
+		local detailsY = 132 + math.floor((height - 168) * 0.52)
+		local detailsBox = make("TextBox", {
+			Size = UDim2.new(1, -22, 1, -(detailsY + 52)),
+			Position = UDim2.fromOffset(11, detailsY),
+			BackgroundColor3 = theme("Background", Color3.fromRGB(8, 8, 10)),
+			BorderSizePixel = 0,
+			Text = "Select a remote log.",
+			TextColor3 = theme("Text", Color3.fromRGB(240, 240, 245)),
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextYAlignment = Enum.TextYAlignment.Top,
+			TextWrapped = false,
+			TextEditable = false,
+			MultiLine = true,
+			ClearTextOnFocus = false,
+			Font = Enum.Font.Code,
+			TextSize = 11,
+			Parent = main
+		})
+		corner(detailsBox, 10)
+		stroke(detailsBox)
+		padding(detailsBox, 8, 8, 8, 8)
+
+		local bottom = make("Frame", {
+			Size = UDim2.new(1, -22, 0, 34),
+			Position = UDim2.new(0, 11, 1, -40),
+			BackgroundTransparency = 1,
+			Parent = main
+		})
+
+		local pauseButton, incomingButton
+
+		local function notify(title, message, duration)
+			if Library.Notify then
+				Library:Notify(title, message, duration or 2)
+			end
+		end
+
+		local function updateStatus()
+			local hookText = HookState.Hooked and "hooked" or "not hooked"
+			local pauseText = panel.Enabled and "logging" or "paused"
+			local incomingText = panel.IncomingEnabled and "incoming on" or "incoming off"
+			statusLabel.Text = "Status: " .. hookText .. " | " .. pauseText .. " | " .. incomingText .. " | logs: " .. tostring(#panel.Logs)
+			if pauseButton then
+				pauseButton.Text = panel.Enabled and "Pause" or "Resume"
+			end
+			if incomingButton then
+				incomingButton.Text = panel.IncomingEnabled and "Incoming On" or "Incoming Off"
+			end
+		end
+
+		local function clearLogRows()
+			for _, child in ipairs(logList:GetChildren()) do
+				if child:IsA("GuiObject") then
+					child:Destroy()
+				end
+			end
+		end
+
+		local function showLogDetails(log)
+			panel.SelectedLog = log
+			detailsBox.Text = buildRemoteContext(log)
+		end
+
+		local function addLogRow(log)
+			local directionShort = log.Direction == "Server -> Client" and "IN" or "OUT"
+			local row = make("TextButton", {
+				Size = UDim2.new(1, 0, 0, 30),
+				BackgroundColor3 = theme("Panel2", Color3.fromRGB(24, 24, 28)),
+				BorderSizePixel = 0,
+				Text = "[" .. directionShort .. "] " .. log.RemoteName .. "  •  " .. log.Method .. "  •  args: " .. tostring(log.ArgsCount),
+				TextColor3 = theme("Text", Color3.fromRGB(240, 240, 245)),
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+				Font = Enum.Font.GothamBold,
+				TextSize = 10,
+				AutoButtonColor = false,
+				Parent = logList
+			})
+			corner(row, 7)
+			padding(row, 7, 7, 0, 0)
+			hover(row, theme("Panel2", Color3.fromRGB(24, 24, 28)), theme("ButtonHover", Color3.fromRGB(57, 57, 65)))
+			row.MouseButton1Click:Connect(function()
+				showLogDetails(log)
+			end)
+			task.defer(function()
+				logList.CanvasPosition = Vector2.new(0, math.max(0, logList.AbsoluteCanvasSize.Y))
+			end)
+		end
+
+		function panel:AddRemoteLog(direction, remote, method, args)
+			if not panel.Enabled then
+				return
+			end
+			if typeof(remote) ~= "Instance" then
+				return
+			end
+			args = args or {}
+			local log = {
+				Direction = tostring(direction or "Unknown"),
+				Method = tostring(method or "Unknown"),
+				Remote = remote,
+				RemoteName = remote.Name,
+				RemoteClass = remote.ClassName,
+				RemoteFullName = remote:GetFullName(),
+				RemotePath = makeSafeLuaPath(remote),
+				TimeText = os.date("%H:%M:%S"),
+				ArgsCount = #args,
+				ArgsPreview = buildArgsPreview(args)
+			}
+			table.insert(panel.Logs, log)
+			while #panel.Logs > maxLogs do
+				table.remove(panel.Logs, 1)
+				local first = logList:FindFirstChildWhichIsA("TextButton")
+				if first then
+					first:Destroy()
+				end
+			end
+			addLogRow(log)
+			updateStatus()
+		end
+
+		function panel.LogOutgoing(remote, method, args)
+			panel:AddRemoteLog("Client -> Server", remote, method, args)
+		end
+
+		local function disconnectIncoming()
+			for _, connection in pairs(panel.IncomingConnections) do
+				pcall(function()
+					connection:Disconnect()
+				end)
+			end
+			for _, connection in pairs(panel.DescendantConnections) do
+				pcall(function()
+					connection:Disconnect()
+				end)
+			end
+			panel.IncomingConnections = {}
+			panel.DescendantConnections = {}
+		end
+
+		local function watchRemoteEvent(remote)
+			if not remote or not remote:IsA("RemoteEvent") then
+				return
+			end
+			if panel.IncomingConnections[remote] then
+				return
+			end
+			local ok, connection = pcall(function()
+				return remote.OnClientEvent:Connect(function(...)
+					panel:AddRemoteLog("Server -> Client", remote, "OnClientEvent", { ... })
+				end)
+			end)
+			if ok and connection then
+				panel.IncomingConnections[remote] = connection
+			end
+		end
+
+		local function watchIncomingRoot(root)
+			if not root then
+				return
+			end
+			for _, item in ipairs(root:GetDescendants()) do
+				if item:IsA("RemoteEvent") then
+					watchRemoteEvent(item)
+				end
+			end
+			local ok, connection = pcall(function()
+				return root.DescendantAdded:Connect(function(item)
+					if panel.IncomingEnabled and item:IsA("RemoteEvent") then
+						watchRemoteEvent(item)
+					end
+				end)
+			end)
+			if ok and connection then
+				table.insert(panel.DescendantConnections, connection)
+			end
+		end
+
+		function panel:SetIncomingEnabled(enabled)
+			panel.IncomingEnabled = enabled == true
+			disconnectIncoming()
+			if panel.IncomingEnabled then
+				watchIncomingRoot(ReplicatedStorage)
+				watchIncomingRoot(Workspace)
+				if LocalPlayer then
+					watchIncomingRoot(LocalPlayer:FindFirstChildOfClass("PlayerGui"))
+					watchIncomingRoot(LocalPlayer:FindFirstChildOfClass("Backpack"))
+				end
+				notify("Remote Monitor", "Incoming RemoteEvents are being watched.", 2)
+			end
+			updateStatus()
+		end
+
+		function panel:OpenPanel()
+			if panel.Open then
+				return
+			end
+			panel.Open = true
+			main.Visible = true
+			local _, newWidth, newHeight, newXOffset, newYOffset = getPanelSize()
+			main.Size = UDim2.fromOffset(newWidth, newHeight)
+			main.Position = UDim2.new(0, -newWidth - 20, 0.5, newYOffset)
+			TweenService:Create(main, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+				Position = UDim2.new(0, newXOffset, 0.5, newYOffset)
+			}):Play()
+			updateStatus()
+		end
+
+		function panel:ClosePanel()
+			panel.Open = false
+			local _, newWidth, _, _, newYOffset = getPanelSize()
+			TweenService:Create(main, TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+				Position = UDim2.new(0, -newWidth - 20, 0.5, newYOffset)
+			}):Play()
+			task.delay(0.17, function()
+				if not panel.Open then
+					main.Visible = false
+				end
+			end)
+		end
+
+		function panel:Toggle()
+			if panel.Open then
+				panel:ClosePanel()
+			else
+				panel:OpenPanel()
+			end
+		end
+
+		function panel:Clear()
+			panel.Logs = {}
+			panel.SelectedLog = nil
+			detailsBox.Text = "Logs cleared."
+			clearLogRows()
+			updateStatus()
+		end
+
+		function panel:PasteSelectedToChat()
+			if not panel.SelectedLog then
+				notify("Remote Monitor", "Select a log first.", 2)
+				return
+			end
+			local context = "\n\n" .. buildRemoteContext(panel.SelectedLog) .. "\n"
+			if chat and chat.AppendToInput then
+				chat:AppendToInput(context)
+				notify("Remote Monitor", "Remote context pasted to AI chat.", 2)
+			elseif safeClipboard(context) then
+				notify("Remote Monitor", "No chat linked. Context copied.", 2)
+			else
+				notify("Remote Monitor", "No chat linked.", 2)
+			end
+		end
+
+		function panel:FindSelectedInDex()
+			if not panel.SelectedLog or not panel.SelectedLog.Remote then
+				notify("Remote Monitor", "Select a log first.", 2)
+				return
+			end
+			local dexPanel = Library.DexPanel
+			if dexPanel and dexPanel.FocusObject then
+				dexPanel:OpenPanel()
+				dexPanel:FocusObject(panel.SelectedLog.Remote)
+				notify("Remote Monitor", "Remote focused in Dex.", 2)
+			else
+				notify("Remote Monitor", "Dex panel not found.", 2)
+			end
+		end
+
+		pauseButton = makeButton(toolbar, "Pause", 0, 0.25, function()
+			panel.Enabled = not panel.Enabled
+			updateStatus()
+		end)
+
+		incomingButton = makeButton(toolbar, "Incoming Off", 0.25, 0.25, function()
+			panel:SetIncomingEnabled(not panel.IncomingEnabled)
+		end)
+
+		makeButton(toolbar, "Clear", 0.5, 0.25, function()
+			panel:Clear()
+		end)
+
+		makeButton(toolbar, "Copy", 0.75, 0.25, function()
+			if not panel.SelectedLog then
+				notify("Remote Monitor", "Select a log first.", 2)
+				return
+			end
+			if safeClipboard(buildRemoteContext(panel.SelectedLog)) then
+				notify("Remote Monitor", "Remote context copied.", 2)
+			else
+				notify("Remote Monitor", "Clipboard unavailable.", 2)
+			end
+		end)
+
+		makeButton(bottom, "Paste AI", 0, 0.34, function()
+			panel:PasteSelectedToChat()
+		end)
+
+		makeButton(bottom, "Find Dex", 0.34, 0.33, function()
+			panel:FindSelectedInDex()
+		end)
+
+		makeButton(bottom, "Copy Path", 0.67, 0.33, function()
+			if not panel.SelectedLog then
+				notify("Remote Monitor", "Select a log first.", 2)
+				return
+			end
+			if safeClipboard(panel.SelectedLog.RemotePath) then
+				notify("Remote Monitor", "Remote path copied.", 2)
+			else
+				notify("Remote Monitor", "Clipboard unavailable.", 2)
+			end
+		end)
+
+		closeButton.MouseButton1Click:Connect(function()
+			panel:ClosePanel()
+		end)
+
+		UserInputService.InputBegan:Connect(function(inputObject, gameProcessed)
+			if gameProcessed then
+				return
+			end
+			if inputObject.KeyCode == Enum.KeyCode.Escape and panel.Open then
+				panel:ClosePanel()
+			end
+		end)
+
+		local hookOk, hookMessage = installNamecallHook()
+		statusLabel.Text = hookOk and "Status: namecall hook ready." or ("Status: " .. tostring(hookMessage))
+		statusLabel.TextColor3 = hookOk and theme("Success", Color3.fromRGB(50, 88, 62)) or theme("Error", Color3.fromRGB(105, 50, 52))
+
+		panel.MonitorId = registerMonitor(panel)
+
+		function panel:Destroy()
+			disconnectIncoming()
+			unregisterMonitor(panel.MonitorId)
+			if gui then
+				gui:Destroy()
+			end
+		end
+
+		updateStatus()
+		self.RemoteMonitorPanel = panel
+		return panel
+	end
+
+	function Library:AddRemoteMonitorToggle(tab, config)
+		config = config or {}
+		local panel = self:CreateRemoteMonitorPanel({
+			Chat = config.Chat,
+			MaxLogs = config.MaxLogs or 150
+		})
+		tab:AddButton("Toggle Remote Monitor", function()
+			panel:Toggle()
+		end)
+		tab:AddLabel("Remote Monitor: outgoing FireServer/InvokeServer via namecall. Incoming watch is optional.")
+		return panel
+	end
+
+	Library.Extensions = Library.Extensions or {}
+	Library.Extensions.RemoteMonitor = {
+		Version = VERSION,
+		Name = "Traceless Remote Monitor"
+	}
+
+	return Library
+end
