@@ -1,4 +1,4 @@
--- Traceless Remote Monitor Extension v1.1
+-- Traceless Remote Monitor Extension v1.2
 -- Separate GitHub/loadstring module for your Traceless project.
 -- Authorized testing/debugging use inside your own Roblox game environment.
 --
@@ -213,6 +213,144 @@ return function(Library)
 		return table.concat(lines, "\n")
 	end
 
+
+	local function luaQuote(text)
+		text = tostring(text or "")
+		return string.format("%q", text)
+	end
+
+	local function valueToLua(value, depth, seen)
+		depth = depth or 0
+		seen = seen or {}
+
+		local valueType = typeof(value)
+
+		if valueType == "nil" then
+			return "nil"
+		end
+
+		if valueType == "string" then
+			return luaQuote(value)
+		end
+
+		if valueType == "number" then
+			if value ~= value or value == math.huge or value == -math.huge then
+				return "0 --[[ unsupported number ]]"
+			end
+
+			return tostring(value)
+		end
+
+		if valueType == "boolean" then
+			return tostring(value)
+		end
+
+		if valueType == "Instance" then
+			return makeSafeLuaPath(value)
+		end
+
+		if valueType == "Vector3" then
+			return ("Vector3.new(%s, %s, %s)"):format(tostring(value.X), tostring(value.Y), tostring(value.Z))
+		end
+
+		if valueType == "Vector2" then
+			return ("Vector2.new(%s, %s)"):format(tostring(value.X), tostring(value.Y))
+		end
+
+		if valueType == "CFrame" then
+			local components = { value:GetComponents() }
+
+			for i, component in ipairs(components) do
+				components[i] = tostring(component)
+			end
+
+			return "CFrame.new(" .. table.concat(components, ", ") .. ")"
+		end
+
+		if valueType == "Color3" then
+			return ("Color3.fromRGB(%d, %d, %d)"):format(math.floor(value.R * 255), math.floor(value.G * 255), math.floor(value.B * 255))
+		end
+
+		if valueType == "EnumItem" then
+			return tostring(value)
+		end
+
+		if valueType == "table" then
+			if seen[value] then
+				return "{} --[[ cycle ]]"
+			end
+
+			if depth >= 3 then
+				return "{} --[[ table too deep ]]"
+			end
+
+			seen[value] = true
+
+			local parts = {}
+			local arrayIndex = 1
+
+			for k, v in pairs(value) do
+				local keyLua
+
+				if type(k) == "number" and k == arrayIndex then
+					keyLua = nil
+					arrayIndex += 1
+				elseif type(k) == "string" and k:match("^[%a_][%w_]*$") then
+					keyLua = k .. " = "
+				else
+					keyLua = "[" .. valueToLua(k, depth + 1, seen) .. "] = "
+				end
+
+				table.insert(parts, "\t" .. (keyLua or "") .. valueToLua(v, depth + 1, seen))
+			end
+
+			if #parts == 0 then
+				return "{}"
+			end
+
+			return "{\n" .. table.concat(parts, ",\n") .. "\n}"
+		end
+
+		return "nil --[[ unsupported " .. valueType .. " ]]"
+	end
+
+	local function buildRunnerCode(log)
+		if not log then
+			return "-- No remote selected."
+		end
+
+		local remotePath = tostring(log.RemotePath or "nil")
+		local args = log.ArgsRaw or {}
+		local argLines = {}
+
+		for _, value in ipairs(args) do
+			table.insert(argLines, "\t" .. valueToLua(value, 1, {}))
+		end
+
+		local method = tostring(log.Method or "FireServer")
+		local callLine
+
+		if method == "InvokeServer" then
+			callLine = "local result = remote:InvokeServer(unpack(args))\nprint(\"Remote result:\", result)"
+		else
+			callLine = "remote:FireServer(unpack(args))"
+		end
+
+		return table.concat({
+			"-- Packaged by Traceless Remote Monitor",
+			"-- Remote: " .. tostring(log.RemoteFullName or log.RemoteName or "Unknown"),
+			"-- Method: " .. method,
+			"",
+			"local remote = " .. remotePath,
+			"",
+			"local args = {",
+			table.concat(argLines, ",\n"),
+			"}",
+			"",
+			callLine
+		}, "\n")
+	end
+
 	local function buildRemoteContext(log)
 		if not log then
 			return "No remote log selected."
@@ -229,7 +367,10 @@ return function(Library)
 			"Args Count: " .. tostring(log.ArgsCount),
 			"",
 			"Args:",
-			tostring(log.ArgsPreview or "(no args)")
+			tostring(log.ArgsPreview or "(no args)"),
+			"",
+			"Packaged Runner:",
+			buildRunnerCode(log)
 		}, "\n")
 	end
 
@@ -381,7 +522,7 @@ return function(Library)
 			Size = UDim2.new(1, -94, 1, 0),
 			Position = UDim2.fromOffset(12, 0),
 			BackgroundTransparency = 1,
-			Text = "Remote Monitor  •  v1.1",
+			Text = "Remote Monitor  •  v1.2",
 			TextColor3 = theme("Text", Color3.fromRGB(240, 240, 245)),
 			TextXAlignment = Enum.TextXAlignment.Left,
 			Font = Enum.Font.GothamBold,
@@ -648,8 +789,13 @@ return function(Library)
 				RemotePath = makeSafeLuaPath(remote),
 				TimeText = os.date("%H:%M:%S"),
 				ArgsCount = #args,
-				ArgsPreview = buildArgsPreview(args)
+				ArgsRaw = args,
+				ArgsPreview = buildArgsPreview(args),
+				RunnerCode = nil
 			}
+
+			log.RunnerCode = buildRunnerCode(log)
+
 			table.insert(panel.Logs, log)
 			while #panel.Logs > maxLogs do
 				table.remove(panel.Logs, 1)
@@ -794,6 +940,78 @@ return function(Library)
 			end
 		end
 
+
+		function panel:CopyRunnerCode()
+			if not panel.SelectedLog then
+				notify("Remote Monitor", "Select a log first.", 2)
+				return
+			end
+
+			local runnerCode = buildRunnerCode(panel.SelectedLog)
+
+			if safeClipboard(runnerCode) then
+				notify("Remote Monitor", "Packaged runner copied.", 2)
+			else
+				updateDetailsText(runnerCode)
+				notify("Remote Monitor", "Clipboard unavailable. Runner shown in details.", 3)
+			end
+		end
+
+		function panel:PasteRunnerToChat()
+			if not panel.SelectedLog then
+				notify("Remote Monitor", "Select a log first.", 2)
+				return
+			end
+
+			local runnerCode = "\n\n```lua\n" .. buildRunnerCode(panel.SelectedLog) .. "\n```\n"
+
+			if chat and chat.AppendToInput then
+				chat:AppendToInput(runnerCode)
+				notify("Remote Monitor", "Runner code pasted to AI chat.", 2)
+			elseif safeClipboard(runnerCode) then
+				notify("Remote Monitor", "No chat linked. Runner copied.", 2)
+			else
+				notify("Remote Monitor", "No chat linked.", 2)
+			end
+		end
+
+		function panel:RunSelectedRemote()
+			if not panel.SelectedLog then
+				notify("Remote Monitor", "Select a log first.", 2)
+				return
+			end
+
+			local log = panel.SelectedLog
+			local remote = log.Remote
+			local args = log.ArgsRaw or {}
+
+			if typeof(remote) ~= "Instance" then
+				notify("Remote Monitor", "Remote instance is missing.", 2)
+				return
+			end
+
+			task.spawn(function()
+				local ok, result = pcall(function()
+					if log.Method == "InvokeServer" and remote:IsA("RemoteFunction") then
+						return remote:InvokeServer(unpack(args))
+					end
+
+					if log.Method == "FireServer" and remote:IsA("RemoteEvent") then
+						remote:FireServer(unpack(args))
+						return "FireServer sent."
+					end
+
+					return "Remote/method mismatch."
+				end)
+
+				if ok then
+					notify("Remote Monitor", tostring(result), 2)
+				else
+					notify("Remote Monitor", "Run failed: " .. tostring(result), 4)
+				end
+			end)
+		end
+
 		function panel:FindSelectedInDex()
 			if not panel.SelectedLog or not panel.SelectedLog.Remote then
 				notify("Remote Monitor", "Select a log first.", 2)
@@ -834,24 +1052,20 @@ return function(Library)
 			end
 		end)
 
-		makeButton(bottom, "Paste AI", 0, 0.34, function()
+		makeButton(bottom, "Paste AI", 0, 0.25, function()
 			panel:PasteSelectedToChat()
 		end)
 
-		makeButton(bottom, "Find Dex", 0.34, 0.33, function()
+		makeButton(bottom, "Find Dex", 0.25, 0.25, function()
 			panel:FindSelectedInDex()
 		end)
 
-		makeButton(bottom, "Copy Path", 0.67, 0.33, function()
-			if not panel.SelectedLog then
-				notify("Remote Monitor", "Select a log first.", 2)
-				return
-			end
-			if safeClipboard(panel.SelectedLog.RemotePath) then
-				notify("Remote Monitor", "Remote path copied.", 2)
-			else
-				notify("Remote Monitor", "Clipboard unavailable.", 2)
-			end
+		makeButton(bottom, "Copy Run", 0.5, 0.25, function()
+			panel:CopyRunnerCode()
+		end)
+
+		makeButton(bottom, "Run", 0.75, 0.25, function()
+			panel:RunSelectedRemote()
 		end)
 
 		closeButton.MouseButton1Click:Connect(function()
