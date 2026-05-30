@@ -1,4 +1,4 @@
--- Traceless Remote Monitor Extension v1.3
+-- Traceless Remote Monitor Extension v1.5
 -- Separate GitHub/loadstring module for your Traceless project.
 -- Authorized testing/debugging use inside your own Roblox game environment.
 --
@@ -25,7 +25,7 @@ return function(Library)
 	local UserInputService = game:GetService("UserInputService")
 
 	local LocalPlayer = Players.LocalPlayer
-	local VERSION = "Remote Monitor v1.0"
+	local VERSION = "Remote Monitor v1.5"
 	local Theme = Library.Theme or {}
 
 	local function theme(name, fallback)
@@ -314,9 +314,53 @@ return function(Library)
 		return "nil --[[ unsupported " .. valueType .. " ]]"
 	end
 
+	local function getRunnableState(log)
+		if not log then
+			return false, "No remote selected."
+		end
+
+		if log.Direction ~= "Client -> Server" then
+			return false, "Only outgoing Client -> Server logs can be replayed."
+		end
+
+		if typeof(log.Remote) ~= "Instance" then
+			return false, "Remote instance is missing."
+		end
+
+		if log.Method == "FireServer" and log.Remote:IsA("RemoteEvent") then
+			return true, "Runnable FireServer log."
+		end
+
+		if log.Method == "InvokeServer" and log.Remote:IsA("RemoteFunction") then
+			return true, "Runnable InvokeServer log."
+		end
+
+		if log.Method == "OnClientEvent" then
+			return false, "Incoming OnClientEvent logs cannot be replayed with FireServer."
+		end
+
+		return false, "Remote/method mismatch: " .. tostring(log.Remote.ClassName) .. " cannot use " .. tostring(log.Method) .. "."
+	end
+
 	local function buildRunnerCode(log)
 		if not log then
 			return "-- No remote selected."
+		end
+
+		local runnable, reason = getRunnableState(log)
+
+		if not runnable then
+			return table.concat({
+				"-- Packaged by Traceless Remote Monitor",
+				"-- Not runnable from the client.",
+				"-- Reason: " .. tostring(reason),
+				"-- Direction: " .. tostring(log.Direction),
+				"-- Method: " .. tostring(log.Method),
+				"-- Remote: " .. tostring(log.RemoteFullName or log.RemoteName or "Unknown"),
+				"",
+				"-- This log is still useful for inspection/copying context,",
+				"-- but the Run button only replays outgoing Client -> Server remotes."
+			}, "\n")
 		end
 
 		local remotePath = tostring(log.RemotePath or "nil")
@@ -363,8 +407,12 @@ return function(Library)
 			"Remote Class: " .. tostring(log.RemoteClass),
 			"Remote FullName: " .. tostring(log.RemoteFullName),
 			"Remote LuaPath: " .. tostring(log.RemotePath),
+			"Caller Script: " .. tostring(log.CallerScriptFullName or "Unknown"),
+			"Caller Path: " .. tostring(log.CallerScriptPath or "Unavailable"),
 			"Time: " .. tostring(log.TimeText),
 			"Args Count: " .. tostring(log.ArgsCount),
+			"Runnable: " .. tostring(select(1, getRunnableState(log))),
+			"Run Note: " .. tostring(select(2, getRunnableState(log))),
 			"",
 			"Args:",
 			tostring(log.ArgsPreview or "(no args)"),
@@ -391,6 +439,50 @@ return function(Library)
 		local xOffset = mobile and 8 or 12
 		local yOffset = -math.floor(height / 2)
 		return mobile, width, height, xOffset, yOffset
+	end
+
+
+	local function getCallerScriptInfo()
+		local callerScript = nil
+
+		if type(getcallingscript) == "function" then
+			local ok, result = pcall(getcallingscript)
+
+			if ok and typeof(result) == "Instance" then
+				callerScript = result
+			end
+		end
+
+		if callerScript then
+			return {
+				Instance = callerScript,
+				Name = callerScript.Name,
+				ClassName = callerScript.ClassName,
+				FullName = callerScript:GetFullName(),
+				Path = makeSafeLuaPath(callerScript)
+			}
+		end
+
+		local debugSource = nil
+
+		if debug and type(debug.info) == "function" then
+			for level = 3, 9 do
+				local ok, source = pcall(debug.info, level, "s")
+
+				if ok and type(source) == "string" and source ~= "" and source ~= "[C]" then
+					debugSource = source
+					break
+				end
+			end
+		end
+
+		return {
+			Instance = nil,
+			Name = debugSource or "Unknown",
+			ClassName = "Unknown",
+			FullName = debugSource or "Unknown",
+			Path = debugSource or "Unavailable"
+		}
 	end
 
 	--// Global hook state
@@ -442,12 +534,15 @@ return function(Library)
 				if (method == "FireServer" or method == "InvokeServer")
 					and typeof(self) == "Instance"
 					and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
+
+					local callerInfo = getCallerScriptInfo()
+
 					for _, monitor in pairs(HookState.Monitors) do
 						if monitor and monitor.Enabled and type(monitor.LogOutgoing) == "function" then
 							-- Safety: never let Remote Monitor errors affect gameplay remotes.
 							-- The original FireServer/InvokeServer call returns immediately below.
 							task.defer(function()
-								pcall(monitor.LogOutgoing, self, method, args)
+								pcall(monitor.LogOutgoing, self, method, args, callerInfo)
 							end)
 						end
 					end
@@ -487,6 +582,13 @@ return function(Library)
 			-- AutoBlock does NOT block the actual remote call.
 			-- It only auto-mutes spammed logs so gameplay remotes are not broken.
 			AutoBlockEnabled = true,
+
+			-- AutoBlock is a logging cooldown, not a gameplay remote blocker.
+			-- When enabled, the same remote/method/direction only logs once every 2 seconds.
+			AutoBlockCooldown = 2.0,
+			AutoCooldowns = {},
+			AutoSuppressed = {},
+
 			AutoBlockWindow = 2.0,
 			AutoBlockLimit = 12,
 			AutoBlockDuration = 8.0,
@@ -532,7 +634,7 @@ return function(Library)
 			Size = UDim2.new(1, -94, 1, 0),
 			Position = UDim2.fromOffset(12, 0),
 			BackgroundTransparency = 1,
-			Text = "Remote Monitor  •  v1.3",
+			Text = "Remote Monitor  •  v1.5",
 			TextColor3 = theme("Text", Color3.fromRGB(240, 240, 245)),
 			TextXAlignment = Enum.TextXAlignment.Left,
 			Font = Enum.Font.GothamBold,
@@ -713,7 +815,7 @@ return function(Library)
 			local hookText = HookState.Hooked and "hooked" or "not hooked"
 			local pauseText = panel.Enabled and "logging" or "paused"
 			local incomingText = panel.IncomingEnabled and "incoming on" or "incoming off"
-			local autoText = panel.AutoBlockEnabled and "auto on" or "auto off"
+			local autoText = panel.AutoBlockEnabled and ("auto " .. tostring(panel.AutoBlockCooldown) .. "s") or "auto off"
 
 			statusLabel.Text = "Status: " .. hookText .. " | " .. pauseText .. " | " .. incomingText .. " | " .. autoText .. " | logs: " .. tostring(#panel.Logs)
 
@@ -764,12 +866,18 @@ return function(Library)
 		end
 
 		local function addLogRow(log)
-			local directionShort = log.Direction == "Server -> Client" and "IN" or "OUT"
+			local directionShort = log.Direction == "Server -> Client" and "IN" or (log.Direction == "AutoBlock" and "AUTO" or "OUT")
+			local callerShort = ""
+
+			if log.Direction == "Client -> Server" and log.CallerScriptName and log.CallerScriptName ~= "Unknown" then
+				callerShort = "  •  from: " .. tostring(log.CallerScriptName)
+			end
+
 			local row = make("TextButton", {
 				Size = UDim2.new(1, 0, 0, 30),
 				BackgroundColor3 = theme("Panel2", Color3.fromRGB(24, 24, 28)),
 				BorderSizePixel = 0,
-				Text = "[" .. directionShort .. "] " .. log.RemoteName .. "  •  " .. log.Method .. "  •  args: " .. tostring(log.ArgsCount),
+				Text = "[" .. directionShort .. "] " .. log.RemoteName .. "  •  " .. log.Method .. callerShort .. "  •  args: " .. tostring(log.ArgsCount),
 				TextColor3 = theme("Text", Color3.fromRGB(240, 240, 245)),
 				TextXAlignment = Enum.TextXAlignment.Left,
 				TextTruncate = Enum.TextTruncate.AtEnd,
@@ -814,6 +922,18 @@ return function(Library)
 
 			local now = os.clock()
 			local key = getRemoteSpamKey(direction, remote, method)
+
+			-- Main AutoBlock behavior:
+			-- cooldown logs only, never the real remote call.
+			local lastLogged = panel.AutoCooldowns[key]
+
+			if lastLogged and (now - lastLogged) < panel.AutoBlockCooldown then
+				panel.AutoSuppressed[key] = (panel.AutoSuppressed[key] or 0) + 1
+				return true
+			end
+
+			panel.AutoCooldowns[key] = now
+
 			local blocked = panel.AutoBlocked[key]
 
 			if blocked and blocked.UnblockAt and now < blocked.UnblockAt then
@@ -903,11 +1023,13 @@ return function(Library)
 		function panel:ClearAutoBlocks()
 			panel.AutoBlockStats = {}
 			panel.AutoBlocked = {}
+			panel.AutoCooldowns = {}
+			panel.AutoSuppressed = {}
 			notify("Remote Monitor", "AutoBlock cache cleared.", 2)
 			updateStatus()
 		end
 
-		function panel:AddRemoteLog(direction, remote, method, args)
+		function panel:AddRemoteLog(direction, remote, method, args, callerInfo)
 			if not panel.Enabled then
 				return
 			end
@@ -919,6 +1041,15 @@ return function(Library)
 				return
 			end
 			args = args or {}
+
+			callerInfo = callerInfo or {
+				Instance = nil,
+				Name = "Unknown",
+				ClassName = "Unknown",
+				FullName = "Unknown",
+				Path = "Unavailable"
+			}
+
 			local log = {
 				Direction = tostring(direction or "Unknown"),
 				Method = tostring(method or "Unknown"),
@@ -927,6 +1058,11 @@ return function(Library)
 				RemoteClass = remote.ClassName,
 				RemoteFullName = remote:GetFullName(),
 				RemotePath = makeSafeLuaPath(remote),
+				CallerScript = callerInfo.Instance,
+				CallerScriptName = callerInfo.Name,
+				CallerScriptClass = callerInfo.ClassName,
+				CallerScriptFullName = callerInfo.FullName,
+				CallerScriptPath = callerInfo.Path,
 				TimeText = os.date("%H:%M:%S"),
 				ArgsCount = #args,
 				ArgsRaw = args,
@@ -948,8 +1084,8 @@ return function(Library)
 			updateStatus()
 		end
 
-		function panel.LogOutgoing(remote, method, args)
-			panel:AddRemoteLog("Client -> Server", remote, method, args)
+		function panel.LogOutgoing(remote, method, args, callerInfo)
+			panel:AddRemoteLog("Client -> Server", remote, method, args, callerInfo)
 		end
 
 		local function disconnectIncoming()
@@ -1122,26 +1258,25 @@ return function(Library)
 			end
 
 			local log = panel.SelectedLog
-			local remote = log.Remote
-			local args = log.ArgsRaw or {}
+			local runnable, reason = getRunnableState(log)
 
-			if typeof(remote) ~= "Instance" then
-				notify("Remote Monitor", "Remote instance is missing.", 2)
+			if not runnable then
+				notify("Remote Monitor", tostring(reason), 4)
+				updateDetailsText(buildRemoteContext(log))
 				return
 			end
 
+			local remote = log.Remote
+			local args = log.ArgsRaw or {}
+
 			task.spawn(function()
 				local ok, result = pcall(function()
-					if log.Method == "InvokeServer" and remote:IsA("RemoteFunction") then
+					if log.Method == "InvokeServer" then
 						return remote:InvokeServer(unpack(args))
 					end
 
-					if log.Method == "FireServer" and remote:IsA("RemoteEvent") then
-						remote:FireServer(unpack(args))
-						return "FireServer sent."
-					end
-
-					return "Remote/method mismatch."
+					remote:FireServer(unpack(args))
+					return "FireServer sent."
 				end)
 
 				if ok then
