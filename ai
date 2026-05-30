@@ -1,4 +1,4 @@
--- Traceless Remote Monitor Extension v1.6
+-- Traceless Remote Monitor Extension v1.7
 -- Separate GitHub/loadstring module for your Traceless project.
 -- Authorized testing/debugging use inside your own Roblox game environment.
 --
@@ -25,7 +25,7 @@ return function(Library)
 	local UserInputService = game:GetService("UserInputService")
 
 	local LocalPlayer = Players.LocalPlayer
-	local VERSION = "Remote Monitor v1.6"
+	local VERSION = "Remote Monitor v1.7"
 	local Theme = Library.Theme or {}
 
 	local function theme(name, fallback)
@@ -407,9 +407,8 @@ return function(Library)
 			"Remote Class: " .. tostring(log.RemoteClass),
 			"Remote FullName: " .. tostring(log.RemoteFullName),
 			"Remote LuaPath: " .. tostring(log.RemotePath),
-			"Caller Script: " .. tostring(log.CallerScriptFullName or "Unknown"),
-			"Caller Path: " .. tostring(log.CallerScriptPath or "Unavailable"),
-			"Time: " .. tostring(log.TimeText),
+			"First/Last Time: " .. tostring(log.TimeText),
+			"Same Call Count: " .. tostring(log.Count or 1),
 			"Args Count: " .. tostring(log.ArgsCount),
 			"Runnable: " .. tostring(select(1, getRunnableState(log))),
 			"Run Note: " .. tostring(select(2, getRunnableState(log))),
@@ -536,25 +535,30 @@ return function(Library)
 					and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
 
 					-- Ultra-safe hook path:
-					-- Do not do heavy caller/debug work directly inside __namecall.
-					-- Defer all monitor work and always return the original remote call below.
-					local remote = self
-					local remoteMethod = method
-					local remoteArgs = args
+					-- 1. Do not call debug/getcallingscript inside __namecall.
+					-- 2. Do not block/delay the original remote.
+					-- 3. Skip Remote Monitor's own calls when checkcaller exists.
+					local shouldLog = true
 
-					for _, monitor in pairs(HookState.Monitors) do
-						if monitor and monitor.Enabled and type(monitor.LogOutgoing) == "function" then
-							task.defer(function()
-								pcall(function()
-									local callerInfo = nil
+					if type(checkcaller) == "function" then
+						local okCheck, isOurCall = pcall(checkcaller)
 
-									if monitor.CallerDetectEnabled then
-										callerInfo = getCallerScriptInfo()
-									end
+						if okCheck and isOurCall then
+							shouldLog = false
+						end
+					end
 
-									monitor.LogOutgoing(remote, remoteMethod, remoteArgs, callerInfo)
+					if shouldLog then
+						local remote = self
+						local remoteMethod = method
+						local remoteArgs = args
+
+						for _, monitor in pairs(HookState.Monitors) do
+							if monitor and monitor.Enabled and type(monitor.LogOutgoing) == "function" then
+								task.defer(function()
+									pcall(monitor.LogOutgoing, remote, remoteMethod, remoteArgs, nil)
 								end)
-							end)
+							end
 						end
 					end
 				end
@@ -590,25 +594,9 @@ return function(Library)
 			Enabled = true,
 			IncomingEnabled = false,
 
-			-- AutoBlock does NOT block the actual remote call.
-			-- It only auto-mutes spammed logs so gameplay remotes are not broken.
-			AutoBlockEnabled = true,
-
-			-- AutoBlock is a logging cooldown, not a gameplay remote blocker.
-			-- When enabled, the same remote/method/direction only logs once every 5 seconds.
-			AutoBlockCooldown = 5.0,
-			AutoCooldowns = {},
-			AutoSuppressed = {},
-
-			-- Caller detection can be heavier in some executors/environments.
-			-- Keep it off by default so remotes are less likely to be affected.
-			CallerDetectEnabled = false,
-
-			AutoBlockWindow = 2.0,
-			AutoBlockLimit = 12,
-			AutoBlockDuration = 8.0,
-			AutoBlockStats = {},
-			AutoBlocked = {},
+			-- v1.7 removes AutoBlock completely.
+			-- Instead, identical remote+method+args logs are grouped and counted.
+			LogsBySignature = {},
 
 			Logs = {},
 			SelectedLog = nil,
@@ -649,7 +637,7 @@ return function(Library)
 			Size = UDim2.new(1, -94, 1, 0),
 			Position = UDim2.fromOffset(12, 0),
 			BackgroundTransparency = 1,
-			Text = "Remote Monitor  •  v1.6",
+			Text = "Remote Monitor  •  v1.7",
 			TextColor3 = theme("Text", Color3.fromRGB(240, 240, 245)),
 			TextXAlignment = Enum.TextXAlignment.Left,
 			Font = Enum.Font.GothamBold,
@@ -818,7 +806,7 @@ return function(Library)
 			Parent = main
 		})
 
-		local pauseButton, incomingButton, autoBlockButton, callerButton
+		local pauseButton, incomingButton
 
 		local function notify(title, message, duration)
 			if Library.Notify then
@@ -830,10 +818,8 @@ return function(Library)
 			local hookText = HookState.Hooked and "hooked" or "not hooked"
 			local pauseText = panel.Enabled and "logging" or "paused"
 			local incomingText = panel.IncomingEnabled and "incoming on" or "incoming off"
-			local autoText = panel.AutoBlockEnabled and ("auto " .. tostring(panel.AutoBlockCooldown) .. "s") or "auto off"
-			local callerText = panel.CallerDetectEnabled and "caller on" or "caller off"
 
-			statusLabel.Text = "Status: " .. hookText .. " | " .. pauseText .. " | " .. incomingText .. " | " .. autoText .. " | " .. callerText .. " | logs: " .. tostring(#panel.Logs)
+			statusLabel.Text = "Status: " .. hookText .. " | " .. pauseText .. " | " .. incomingText .. " | grouped logs: " .. tostring(#panel.Logs)
 
 			if pauseButton then
 				pauseButton.Text = panel.Enabled and "Pause" or "Resume"
@@ -841,14 +827,6 @@ return function(Library)
 
 			if incomingButton then
 				incomingButton.Text = panel.IncomingEnabled and "Incoming On" or "Incoming Off"
-			end
-
-			if autoBlockButton then
-				autoBlockButton.Text = panel.AutoBlockEnabled and "Auto On" or "Auto Off"
-			end
-
-			if callerButton then
-				callerButton.Text = panel.CallerDetectEnabled and "Caller On" or "Caller Off"
 			end
 		end
 
@@ -885,19 +863,55 @@ return function(Library)
 			updateDetailsText(buildRemoteContext(log))
 		end
 
-		local function addLogRow(log)
-			local directionShort = log.Direction == "Server -> Client" and "IN" or (log.Direction == "AutoBlock" and "AUTO" or "OUT")
-			local callerShort = ""
+		local function argsSignature(args)
+			args = args or {}
 
-			if log.Direction == "Client -> Server" and log.CallerScriptName and log.CallerScriptName ~= "Unknown" then
-				callerShort = "  •  from: " .. tostring(log.CallerScriptName)
+			local parts = {}
+
+			for i, value in ipairs(args) do
+				table.insert(parts, tostring(i) .. ":" .. typeof(value) .. "=" .. previewValue(value, 0, {}))
 			end
+
+			return table.concat(parts, "|")
+		end
+
+		local function getLogSignature(direction, remote, method, args)
+			local remoteName = "UnknownRemote"
+
+			if typeof(remote) == "Instance" then
+				local ok, result = pcall(function()
+					return remote:GetFullName()
+				end)
+
+				remoteName = (ok and result) or remote.Name
+			end
+
+			return tostring(direction) .. "|" .. tostring(method) .. "|" .. remoteName .. "|" .. argsSignature(args)
+		end
+
+		local function updateLogRow(log)
+			if not log or not log.Row or not log.Row.Parent then
+				return
+			end
+
+			local directionShort = log.Direction == "Server -> Client" and "IN" or "OUT"
+			local countText = log.Count and log.Count > 1 and (" x" .. tostring(log.Count)) or ""
+			log.Row.Text = "[" .. directionShort .. countText .. "] " .. log.RemoteName .. "  •  " .. log.Method .. "  •  args: " .. tostring(log.ArgsCount)
+
+			if panel.SelectedLog == log then
+				updateDetailsText(buildRemoteContext(log))
+			end
+		end
+
+		local function addLogRow(log)
+			local directionShort = log.Direction == "Server -> Client" and "IN" or "OUT"
+			local countText = log.Count and log.Count > 1 and (" x" .. tostring(log.Count)) or ""
 
 			local row = make("TextButton", {
 				Size = UDim2.new(1, 0, 0, 30),
 				BackgroundColor3 = theme("Panel2", Color3.fromRGB(24, 24, 28)),
 				BorderSizePixel = 0,
-				Text = "[" .. directionShort .. "] " .. log.RemoteName .. "  •  " .. log.Method .. callerShort .. "  •  args: " .. tostring(log.ArgsCount),
+				Text = "[" .. directionShort .. countText .. "] " .. log.RemoteName .. "  •  " .. log.Method .. "  •  args: " .. tostring(log.ArgsCount),
 				TextColor3 = theme("Text", Color3.fromRGB(240, 240, 245)),
 				TextXAlignment = Enum.TextXAlignment.Left,
 				TextTruncate = Enum.TextTruncate.AtEnd,
@@ -906,169 +920,44 @@ return function(Library)
 				AutoButtonColor = false,
 				Parent = logList
 			})
+
+			log.Row = row
+
 			corner(row, 7)
 			padding(row, 7, 7, 0, 0)
 			hover(row, theme("Panel2", Color3.fromRGB(24, 24, 28)), theme("ButtonHover", Color3.fromRGB(57, 57, 65)))
+
 			row.MouseButton1Click:Connect(function()
 				showLogDetails(log)
 			end)
+
 			task.defer(function()
 				logList.CanvasPosition = Vector2.new(0, math.max(0, logList.AbsoluteCanvasSize.Y))
 			end)
 		end
 
-		local function getRemoteSpamKey(direction, remote, method)
-			local fullName = "UnknownRemote"
-
-			if typeof(remote) == "Instance" then
-				local ok, result = pcall(function()
-					return remote:GetFullName()
-				end)
-
-				if ok and result then
-					fullName = result
-				else
-					fullName = remote.Name
-				end
-			end
-
-			return tostring(direction) .. "|" .. tostring(method) .. "|" .. fullName
-		end
-
-		function panel:IsAutoBlocked(direction, remote, method)
-			if not panel.AutoBlockEnabled then
-				return false
-			end
-
-			local now = os.clock()
-			local key = getRemoteSpamKey(direction, remote, method)
-
-			-- Main AutoBlock behavior:
-			-- cooldown logs only, never the real remote call.
-			local lastLogged = panel.AutoCooldowns[key]
-
-			if lastLogged and (now - lastLogged) < panel.AutoBlockCooldown then
-				panel.AutoSuppressed[key] = (panel.AutoSuppressed[key] or 0) + 1
-				return true
-			end
-
-			panel.AutoCooldowns[key] = now
-
-			local blocked = panel.AutoBlocked[key]
-
-			if blocked and blocked.UnblockAt and now < blocked.UnblockAt then
-				blocked.Suppressed = (blocked.Suppressed or 0) + 1
-				return true
-			end
-
-			if blocked and blocked.UnblockAt and now >= blocked.UnblockAt then
-				panel.AutoBlocked[key] = nil
-
-				local remoteName = typeof(remote) == "Instance" and remote.Name or "Remote"
-				local unblockLog = {
-					Direction = "AutoBlock",
-					Method = "Unblocked",
-					Remote = remote,
-					RemoteName = remoteName,
-					RemoteClass = typeof(remote) == "Instance" and remote.ClassName or "Unknown",
-					RemoteFullName = typeof(remote) == "Instance" and remote:GetFullName() or "Unknown",
-					RemotePath = typeof(remote) == "Instance" and makeSafeLuaPath(remote) or "nil",
-					TimeText = os.date("%H:%M:%S"),
-					ArgsCount = 0,
-					ArgsRaw = {},
-					ArgsPreview = "AutoBlock expired. Logging resumed.",
-					RunnerCode = "-- AutoBlock expired. Logging resumed."
-				}
-
-				table.insert(panel.Logs, unblockLog)
-				addLogRow(unblockLog)
-			end
-
-			local stat = panel.AutoBlockStats[key]
-
-			if not stat or now - stat.StartTime > panel.AutoBlockWindow then
-				stat = {
-					StartTime = now,
-					Count = 0
-				}
-
-				panel.AutoBlockStats[key] = stat
-			end
-
-			stat.Count += 1
-
-			if stat.Count >= panel.AutoBlockLimit then
-				panel.AutoBlocked[key] = {
-					UnblockAt = now + panel.AutoBlockDuration,
-					Suppressed = 0
-				}
-
-				panel.AutoBlockStats[key] = nil
-
-				local remoteName = typeof(remote) == "Instance" and remote.Name or "Remote"
-				local blockLog = {
-					Direction = "AutoBlock",
-					Method = "Muted",
-					Remote = remote,
-					RemoteName = remoteName,
-					RemoteClass = typeof(remote) == "Instance" and remote.ClassName or "Unknown",
-					RemoteFullName = typeof(remote) == "Instance" and remote:GetFullName() or "Unknown",
-					RemotePath = typeof(remote) == "Instance" and makeSafeLuaPath(remote) or "nil",
-					TimeText = os.date("%H:%M:%S"),
-					ArgsCount = 0,
-					ArgsRaw = {},
-					ArgsPreview = "This remote was logging too fast, so Remote Monitor muted its logs for " .. tostring(panel.AutoBlockDuration) .. " seconds. Gameplay remote calls are still allowed.",
-					RunnerCode = "-- AutoBlock muted logging only. It did not block the actual remote call."
-				}
-
-				table.insert(panel.Logs, blockLog)
-
-				while #panel.Logs > maxLogs do
-					table.remove(panel.Logs, 1)
-					local first = logList:FindFirstChildWhichIsA("TextButton")
-
-					if first then
-						first:Destroy()
-					end
-				end
-
-				addLogRow(blockLog)
-				updateStatus()
-				return true
-			end
-
-			return false
-		end
-
-		function panel:ClearAutoBlocks()
-			panel.AutoBlockStats = {}
-			panel.AutoBlocked = {}
-			panel.AutoCooldowns = {}
-			panel.AutoSuppressed = {}
-			notify("Remote Monitor", "AutoBlock cache cleared.", 2)
-			updateStatus()
-		end
-
-		function panel:AddRemoteLog(direction, remote, method, args, callerInfo)
+		function panel:AddRemoteLog(direction, remote, method, args)
 			if not panel.Enabled then
 				return
 			end
 
-			if panel:IsAutoBlocked(direction, remote, method) then
-				return
-			end
 			if typeof(remote) ~= "Instance" then
 				return
 			end
+
 			args = args or {}
 
-			callerInfo = callerInfo or {
-				Instance = nil,
-				Name = "Unknown",
-				ClassName = "Unknown",
-				FullName = "Unknown",
-				Path = "Unavailable"
-			}
+			local signature = getLogSignature(direction, remote, method, args)
+			local existingLog = panel.LogsBySignature[signature]
+
+			if existingLog then
+				existingLog.Count = (existingLog.Count or 1) + 1
+				existingLog.LastTimeText = os.date("%H:%M:%S")
+				existingLog.TimeText = existingLog.LastTimeText
+				updateLogRow(existingLog)
+				updateStatus()
+				return
+			end
 
 			local log = {
 				Direction = tostring(direction or "Unknown"),
@@ -1078,12 +967,10 @@ return function(Library)
 				RemoteClass = remote.ClassName,
 				RemoteFullName = remote:GetFullName(),
 				RemotePath = makeSafeLuaPath(remote),
-				CallerScript = callerInfo.Instance,
-				CallerScriptName = callerInfo.Name,
-				CallerScriptClass = callerInfo.ClassName,
-				CallerScriptFullName = callerInfo.FullName,
-				CallerScriptPath = callerInfo.Path,
 				TimeText = os.date("%H:%M:%S"),
+				LastTimeText = os.date("%H:%M:%S"),
+				Count = 1,
+				Signature = signature,
 				ArgsCount = #args,
 				ArgsRaw = args,
 				ArgsPreview = buildArgsPreview(args),
@@ -1093,19 +980,32 @@ return function(Library)
 			log.RunnerCode = buildRunnerCode(log)
 
 			table.insert(panel.Logs, log)
+			panel.LogsBySignature[signature] = log
+
 			while #panel.Logs > maxLogs do
-				table.remove(panel.Logs, 1)
-				local first = logList:FindFirstChildWhichIsA("TextButton")
-				if first then
-					first:Destroy()
+				local removed = table.remove(panel.Logs, 1)
+
+				if removed and removed.Signature then
+					panel.LogsBySignature[removed.Signature] = nil
+				end
+
+				if removed and removed.Row and removed.Row.Parent then
+					removed.Row:Destroy()
+				else
+					local first = logList:FindFirstChildWhichIsA("TextButton")
+
+					if first then
+						first:Destroy()
+					end
 				end
 			end
+
 			addLogRow(log)
 			updateStatus()
 		end
 
-		function panel.LogOutgoing(remote, method, args, callerInfo)
-			panel:AddRemoteLog("Client -> Server", remote, method, args, callerInfo)
+		function panel.LogOutgoing(remote, method, args)
+			panel:AddRemoteLog("Client -> Server", remote, method, args)
 		end
 
 		local function disconnectIncoming()
@@ -1214,6 +1114,7 @@ return function(Library)
 
 		function panel:Clear()
 			panel.Logs = {}
+			panel.LogsBySignature = {}
 			panel.SelectedLog = nil
 			updateDetailsText("Logs cleared.")
 			clearLogRows()
@@ -1331,39 +1232,36 @@ return function(Library)
 			panel:SetIncomingEnabled(not panel.IncomingEnabled)
 		end)
 
-		autoBlockButton = makeButton(toolbar, "Auto On", 0.5, 0.25, function()
-			panel.AutoBlockEnabled = not panel.AutoBlockEnabled
+		makeButton(toolbar, "Clear", 0.5, 0.25, function()
+			panel:Clear()
+		end)
 
-			if not panel.AutoBlockEnabled then
-				panel:ClearAutoBlocks()
+		makeButton(toolbar, "Copy", 0.75, 0.25, function()
+			if not panel.SelectedLog then
+				notify("Remote Monitor", "Select a log first.", 2)
+				return
 			end
 
-			updateStatus()
+			if safeClipboard(buildRemoteContext(panel.SelectedLog)) then
+				notify("Remote Monitor", "Remote context copied.", 2)
+			else
+				notify("Remote Monitor", "Clipboard unavailable.", 2)
+			end
 		end)
 
-		callerButton = makeButton(toolbar, "Caller Off", 0.75, 0.25, function()
-			panel.CallerDetectEnabled = not panel.CallerDetectEnabled
-			updateStatus()
-		end)
-
-		makeButton(bottom, "Clear", 0, 0.2, function()
-			panel:Clear()
-			panel:ClearAutoBlocks()
-		end)
-
-		makeButton(bottom, "AI", 0.2, 0.2, function()
+		makeButton(bottom, "AI", 0, 0.25, function()
 			panel:PasteSelectedToChat()
 		end)
 
-		makeButton(bottom, "Dex", 0.4, 0.2, function()
+		makeButton(bottom, "Dex", 0.25, 0.25, function()
 			panel:FindSelectedInDex()
 		end)
 
-		makeButton(bottom, "CopyRun", 0.6, 0.2, function()
+		makeButton(bottom, "CopyRun", 0.5, 0.25, function()
 			panel:CopyRunnerCode()
 		end)
 
-		makeButton(bottom, "Run", 0.8, 0.2, function()
+		makeButton(bottom, "Run", 0.75, 0.25, function()
 			panel:RunSelectedRemote()
 		end)
 
